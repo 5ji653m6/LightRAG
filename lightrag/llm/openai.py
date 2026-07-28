@@ -1,6 +1,7 @@
 from ..utils import verbose_debug, VERBOSE_DEBUG
 import os
 import logging
+import warnings
 
 from collections.abc import AsyncIterator
 
@@ -15,6 +16,8 @@ from openai import (
     APIConnectionError,
     RateLimitError,
     APITimeoutError,
+    InternalServerError,
+    BadRequestError,
 )
 from tenacity import (
     retry,
@@ -26,9 +29,9 @@ from lightrag.utils import (
     wrap_embedding_func_with_attrs,
     safe_unicode_decode,
     logger,
+    TruncatedResponse,
 )
 
-from lightrag.types import GPTKeywordExtractionFormat
 from lightrag.api import __api_version__
 
 import numpy as np
@@ -73,6 +76,30 @@ class InvalidResponseError(Exception):
     """Custom exception class for triggering retry mechanism"""
 
     pass
+
+
+class TransientBadRequestError(Exception):
+    """Wrapper to trigger retry on transient HTTP 400 errors.
+
+    Some 400s are not genuine client errors: the OpenAI API (or a proxy in
+    front of it) intermittently returns "We could not parse the JSON body of
+    your request" when the request body is corrupted/truncated in transit.
+    These succeed on retry, so we re-raise them as this retryable type while
+    letting genuine 400s (bad params, content policy, etc.) fail fast.
+    """
+
+    pass
+
+
+def _validate_openai_response_format(response_format: Any | None) -> None:
+    """Reject typed structured-output helpers; only wire-format dicts are supported."""
+    if response_format is None or isinstance(response_format, dict):
+        return
+
+    raise TypeError(
+        "openai_complete_if_cache only supports dict response_format payloads; "
+        "typed/Pydantic response_format values are not supported."
+    )
 
 
 # Module-level cache for tiktoken encodings
@@ -196,6 +223,9 @@ def create_openai_async_client(
         return AsyncOpenAI(**merged_configs)
 
 
+# Token-limit-truncated completions (finish_reason == "length") are returned
+# wrapped in TruncatedResponse so the cache layer skips persisting incomplete
+# output. See the "Note on truncated structured output" in the docstring below.
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
@@ -204,6 +234,11 @@ def create_openai_async_client(
         | retry_if_exception_type(APIConnectionError)
         | retry_if_exception_type(APITimeoutError)
         | retry_if_exception_type(InvalidResponseError)
+        # Retry transient HTTP 5xx (OpenAI "500 server_error", proxy "upstream
+        # connect error"). InternalServerError covers all status >= 500.
+        | retry_if_exception_type(InternalServerError)
+        # Retry transient "could not parse JSON body" 400s (see handler below).
+        | retry_if_exception_type(TransientBadRequestError)
     ),
 )
 async def openai_complete_if_cache(
@@ -221,6 +256,7 @@ async def openai_complete_if_cache(
     use_azure: bool = False,
     azure_deployment: str | None = None,
     api_version: str | None = None,
+    image_inputs: list[Any] | None = None,
     **kwargs: Any,
 ) -> str:
     """Complete a prompt using OpenAI's API with caching support and Chain of Thought (COT) integration.
@@ -228,6 +264,23 @@ async def openai_complete_if_cache(
     This function supports automatic integration of reasoning content from models that provide
     Chain of Thought capabilities. The reasoning content is seamlessly integrated into the response
     using <think>...</think> tags.
+
+    Structured output design note:
+    - This adapter supports dict-based OpenAI response_format payloads,
+      including ``{"type": "json_object"}`` and dict-form ``json_schema``.
+    - Typed/Pydantic ``response_format`` helpers are rejected explicitly.
+    - Structured responses are returned as raw text from ``message.content``
+      and are not locally schema-validated here.
+    - ``keyword_extraction`` is deprecated; prefer
+      ``response_format={"type": "json_object"}`` instead.
+
+    Note on truncated structured output: when a completion stops with
+    `finish_reason == "length"`, callers may still receive partial raw JSON from
+    `completion.choices[0].message.content`. That payload is returned unchanged
+    for best-effort recovery, but wrapped in `TruncatedResponse` (a `str`
+    subclass) so the cache layer can detect and skip persisting it. This
+    prevents later runs — even with a higher token budget — from reusing the
+    incomplete data. See `is_truncated_response` in `lightrag.utils`.
 
     Note on `reasoning_content`: This feature relies on a Deepseek Style `reasoning_content`
     in the API response, which may be provided by OpenAI-compatible endpoints that support
@@ -254,8 +307,10 @@ async def openai_complete_if_cache(
         token_tracker: Optional token usage tracker for monitoring API usage.
         stream: Whether to stream the response. Default is False.
         timeout: Request timeout in seconds. Default is None.
-        keyword_extraction: Whether to enable keyword extraction mode. When True, triggers
-            special response formatting for keyword extraction. Default is False.
+        keyword_extraction: Deprecated compatibility shim. When True and no
+            explicit ``response_format`` is supplied, it is mapped to
+            ``{"type": "json_object"}``. Prefer passing ``response_format``
+            directly. Default is False.
         use_azure: Whether to use Azure OpenAI service instead of standard OpenAI.
             When True, creates an AsyncAzureOpenAI client. Default is False.
         azure_deployment: Azure OpenAI deployment name. Only used when use_azure=True.
@@ -265,6 +320,10 @@ async def openai_complete_if_cache(
             environment variable.
         **kwargs: Additional keyword arguments to pass to the OpenAI API.
             Special kwargs:
+            - response_format: Structured output control forwarded to the OpenAI
+                chat completions API. This adapter accepts dict payloads such
+                as ``{"type": "json_object"}`` and dict-form ``json_schema``,
+                but rejects typed/Pydantic response_format values.
             - openai_client_configs: Dict of configuration options for the AsyncOpenAI client.
                 These will be passed to the client constructor but will be overridden by
                 explicit parameters (api_key, base_url). Supports proxy configuration,
@@ -293,9 +352,29 @@ async def openai_complete_if_cache(
     # Extract client configuration options
     client_configs = kwargs.pop("openai_client_configs", {})
 
-    # Handle keyword extraction mode
-    if keyword_extraction:
-        kwargs["response_format"] = GPTKeywordExtractionFormat
+    # Deprecation shims: map legacy boolean flags to response_format only when
+    # an explicit response_format was not supplied by the caller. Prefer passing
+    # response_format directly.
+    entity_extraction = kwargs.pop("entity_extraction", False)
+    if entity_extraction and kwargs.get("response_format") is None:
+        warnings.warn(
+            "openai_complete_if_cache(entity_extraction=True) is deprecated; "
+            "pass response_format={'type': 'json_object'} instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        kwargs["response_format"] = {"type": "json_object"}
+    if keyword_extraction and kwargs.get("response_format") is None:
+        warnings.warn(
+            "openai_complete_if_cache(keyword_extraction=True) is deprecated; "
+            "pass response_format={'type': 'json_object'} instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        kwargs["response_format"] = {"type": "json_object"}
+    _validate_openai_response_format(kwargs.get("response_format"))
+    if kwargs.get("response_format") is not None:
+        enable_cot = False
 
     # Create the OpenAI client (supports both OpenAI and Azure)
     openai_async_client = create_openai_async_client(
@@ -313,7 +392,23 @@ async def openai_complete_if_cache(
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.extend(history_messages)
-    messages.append({"role": "user", "content": prompt})
+    if image_inputs:
+        from lightrag.llm._vision_utils import normalize_image_inputs
+
+        normalized_images = normalize_image_inputs(image_inputs)
+        user_content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for img in normalized_images:
+            user_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{img.mime_type};base64,{img.base64_str}"
+                    },
+                }
+            )
+        messages.append({"role": "user", "content": user_content})
+    else:
+        messages.append({"role": "user", "content": prompt})
 
     logger.debug("===== Entering func of LLM =====")
     logger.debug(f"Model: {model}   Base URL: {base_url}")
@@ -337,31 +432,55 @@ async def openai_complete_if_cache(
     api_model = azure_deployment if use_azure and azure_deployment else model
 
     try:
-        # Don't use async with context manager, use client directly
-        if "response_format" in kwargs:
-            # beta.chat.completions.parse() provides structured output and is inherently
-            # non-streaming; passing `stream=True` would raise a TypeError at runtime.
-            # Strip `stream` from kwargs before forwarding to avoid this error when
-            # OpenAI-compatible providers (e.g. DeepSeek) set stream in their kwargs.
-            parse_kwargs = {k: v for k, v in kwargs.items() if k != "stream"}
-            response = await openai_async_client.chat.completions.parse(
-                model=api_model, messages=messages, **parse_kwargs
-            )
-        else:
-            response = await openai_async_client.chat.completions.create(
-                model=api_model, messages=messages, **kwargs
-            )
+        # Single dispatch: create() covers the dict-based response_format
+        # payloads used by this project. Typed/Pydantic helpers are rejected
+        # above. Length-truncated responses with non-empty content are
+        # returned unchanged so upstream tolerant JSON parsing can still
+        # salvage them; finish_reason is only inspected when content is empty
+        # (see the empty-content diagnostics below).
+        response = await openai_async_client.chat.completions.create(
+            model=api_model, messages=messages, **kwargs
+        )
     except APITimeoutError as e:
         logger.error(f"OpenAI API Timeout Error: {e}")
-        await openai_async_client.close()  # Ensure client is closed
+        try:
+            await openai_async_client.close()
+        except Exception as close_error:
+            logger.warning(f"Failed to close OpenAI client: {close_error}")
         raise
     except APIConnectionError as e:
         logger.error(f"OpenAI API Connection Error: {e}")
-        await openai_async_client.close()  # Ensure client is closed
+        try:
+            await openai_async_client.close()
+        except Exception as close_error:
+            logger.warning(f"Failed to close OpenAI client: {close_error}")
         raise
     except RateLimitError as e:
         logger.error(f"OpenAI API Rate Limit Error: {e}")
-        await openai_async_client.close()  # Ensure client is closed
+        try:
+            await openai_async_client.close()
+        except Exception as close_error:
+            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        raise
+    except BadRequestError as e:
+        # A "could not parse JSON body" 400 is transient (corrupted/truncated
+        # request body in transit) and succeeds on retry; re-raise it as a
+        # retryable type. Genuine 400s (bad params, content policy) fail fast.
+        # Either way we must close the client before re-raising, matching the
+        # other except branches above — otherwise non-transient 400s would
+        # leak httpx connections in validation-heavy/misconfigured runs.
+        try:
+            await openai_async_client.close()
+        except Exception as close_error:
+            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        # Heuristic: match on the provider's error wording. It can drift across
+        # providers/proxies or localization, and a genuinely malformed request
+        # body (e.g. invalid user-supplied JSON) could also surface this text —
+        # in that case we simply retry 3x and still fail fast. We accept that
+        # "retry too much" trade-off to recover the common transient case.
+        if "could not parse" in str(e).lower():
+            logger.warning(f"Transient JSON-parse 400 from OpenAI, will retry: {e}")
+            raise TransientBadRequestError(str(e)) from e
         raise
     except Exception as e:
         body = getattr(e, "body", None)
@@ -378,7 +497,10 @@ async def openai_complete_if_cache(
         logger.error(
             f"OpenAI API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}{extra}"
         )
-        await openai_async_client.close()  # Ensure client is closed
+        try:
+            await openai_async_client.close()
+        except Exception as close_error:
+            logger.warning(f"Failed to close OpenAI client: {close_error}")
         raise
 
     if hasattr(response, "__aiter__"):
@@ -513,7 +635,12 @@ async def openai_complete_if_cache(
                             f"Failed to close stream response: {close_error}"
                         )
                 # Ensure client is closed in case of exception
-                await openai_async_client.close()
+                try:
+                    await openai_async_client.close()
+                except Exception as client_close_error:
+                    logger.warning(
+                        f"Failed to close OpenAI client after stream error: {client_close_error}"
+                    )
                 raise
             finally:
                 # Final safety check for unclosed COT tags
@@ -566,7 +693,10 @@ async def openai_complete_if_cache(
                 or not hasattr(response.choices[0], "message")
             ):
                 logger.error("Invalid response from OpenAI API")
-                await openai_async_client.close()  # Ensure client is closed
+                try:
+                    await openai_async_client.close()
+                except Exception as close_error:
+                    logger.warning(f"Failed to close OpenAI client: {close_error}")
                 raise InvalidResponseError("Invalid response from OpenAI API")
 
             message = response.choices[0].message
@@ -618,13 +748,70 @@ async def openai_complete_if_cache(
 
                 # Validate final content
                 if not final_content or final_content.strip() == "":
-                    logger.error("Received empty content from OpenAI API")
-                    await openai_async_client.close()  # Ensure client is closed
-                    raise InvalidResponseError("Received empty content from OpenAI API")
+                    # Distinguish the empty-content failure modes so the retry
+                    # ERROR lines (and the final RetryError) carry the root
+                    # cause: reasoning models swallowing output vs token-limit
+                    # truncation vs a genuinely empty response.
+                    finish_reason = getattr(response.choices[0], "finish_reason", None)
+                    usage = getattr(response, "usage", None)
+                    completion_tokens = getattr(usage, "completion_tokens", None)
+                    usage_details = getattr(usage, "completion_tokens_details", None)
+                    reasoning_tokens = getattr(usage_details, "reasoning_tokens", None)
+                    reasoning_len = (
+                        len(reasoning_content.strip()) if reasoning_content else 0
+                    )
+                    diagnostics = (
+                        f"finish_reason={finish_reason if finish_reason is not None else 'n/a'}, "
+                        f"completion_tokens={completion_tokens if completion_tokens is not None else 'n/a'}, "
+                        f"reasoning_tokens={reasoning_tokens if reasoning_tokens is not None else 'n/a'}, "
+                        f"reasoning_content_len={reasoning_len}"
+                    )
+                    if finish_reason == "length":
+                        hint = (
+                            "generation hit the token limit before emitting "
+                            "any content"
+                            + (
+                                " (budget consumed by reasoning)"
+                                if reasoning_len
+                                else ""
+                            )
+                            + "; consider raising max_tokens or disabling "
+                            "thinking mode"
+                        )
+                    elif reasoning_len:
+                        hint = (
+                            "model returned reasoning-only output "
+                            "(reasoning_content is discarded on this path); "
+                            "consider disabling thinking mode for this role"
+                        )
+                    else:
+                        hint = "model produced no output"
+                    logger.error(
+                        f"Received empty content from OpenAI API "
+                        f"({diagnostics}): {hint}"
+                    )
+                    try:
+                        await openai_async_client.close()
+                    except Exception as close_error:
+                        logger.warning(f"Failed to close OpenAI client: {close_error}")
+                    raise InvalidResponseError(
+                        f"Received empty content from OpenAI API ({diagnostics})"
+                    )
 
             # Apply Unicode decoding to final content if needed
             if r"\u" in final_content:
                 final_content = safe_unicode_decode(final_content.encode("utf-8"))
+
+            # Flag token-limit truncation so the cache layer skips persisting
+            # partial output. The content is still returned unchanged for
+            # best-effort salvage (e.g. tolerant JSON parsing); TruncatedResponse
+            # is a str subclass, so downstream processing is unaffected.
+            if getattr(response.choices[0], "finish_reason", None) == "length":
+                logger.warning(
+                    "OpenAI response truncated by token limit "
+                    f"(finish_reason=length, content_len={len(final_content)}), returning partial content"
+                )
+                final_content = TruncatedResponse(final_content)
 
             if token_tracker and hasattr(response, "usage"):
                 token_counts = {
@@ -642,7 +829,12 @@ async def openai_complete_if_cache(
             return final_content
         finally:
             # Ensure client is closed in all cases for non-streaming responses
-            await openai_async_client.close()
+            try:
+                await openai_async_client.close()
+            except Exception as close_error:
+                logger.warning(
+                    f"Failed to close OpenAI client in non-streaming finally block: {close_error}"
+                )
 
 
 async def openai_complete(
@@ -650,10 +842,13 @@ async def openai_complete(
     system_prompt=None,
     history_messages=None,
     keyword_extraction=False,
+    entity_extraction=False,
     **kwargs,
 ) -> Union[str, AsyncIterator[str]]:
     if history_messages is None:
         history_messages = []
+    # Pop entity_extraction from kwargs if also passed there (avoid duplication)
+    entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
     model_name = kwargs["hashing_kv"].global_config["llm_model_name"]
     return await openai_complete_if_cache(
         model_name,
@@ -661,6 +856,7 @@ async def openai_complete(
         system_prompt=system_prompt,
         history_messages=history_messages,
         keyword_extraction=keyword_extraction,
+        entity_extraction=entity_extraction,
         **kwargs,
     )
 
@@ -671,10 +867,12 @@ async def gpt_4o_complete(
     history_messages=None,
     enable_cot: bool = False,
     keyword_extraction=False,
+    entity_extraction=False,
     **kwargs,
 ) -> str:
     if history_messages is None:
         history_messages = []
+    entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
     return await openai_complete_if_cache(
         "gpt-4o",
         prompt,
@@ -682,6 +880,7 @@ async def gpt_4o_complete(
         history_messages=history_messages,
         enable_cot=enable_cot,
         keyword_extraction=keyword_extraction,
+        entity_extraction=entity_extraction,
         **kwargs,
     )
 
@@ -692,10 +891,12 @@ async def gpt_4o_mini_complete(
     history_messages=None,
     enable_cot: bool = False,
     keyword_extraction=False,
+    entity_extraction=False,
     **kwargs,
 ) -> str:
     if history_messages is None:
         history_messages = []
+    entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
     return await openai_complete_if_cache(
         "gpt-4o-mini",
         prompt,
@@ -703,6 +904,7 @@ async def gpt_4o_mini_complete(
         history_messages=history_messages,
         enable_cot=enable_cot,
         keyword_extraction=keyword_extraction,
+        entity_extraction=entity_extraction,
         **kwargs,
     )
 
@@ -713,10 +915,12 @@ async def nvidia_openai_complete(
     history_messages=None,
     enable_cot: bool = False,
     keyword_extraction=False,
+    entity_extraction=False,
     **kwargs,
 ) -> str:
     if history_messages is None:
         history_messages = []
+    entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
     result = await openai_complete_if_cache(
         "nvidia/llama-3.1-nemotron-70b-instruct",  # context length 128k
         prompt,
@@ -724,6 +928,7 @@ async def nvidia_openai_complete(
         history_messages=history_messages,
         enable_cot=enable_cot,
         keyword_extraction=keyword_extraction,
+        entity_extraction=entity_extraction,
         base_url="https://integrate.api.nvidia.com/v1",
         **kwargs,
     )
@@ -743,6 +948,8 @@ async def nvidia_openai_complete(
         retry_if_exception_type(RateLimitError)
         | retry_if_exception_type(APIConnectionError)
         | retry_if_exception_type(APITimeoutError)
+        # Retry transient HTTP 5xx (OpenAI 500 / proxy upstream errors).
+        | retry_if_exception_type(InternalServerError)
     ),
 )
 async def openai_embed(
@@ -958,6 +1165,7 @@ async def azure_openai_complete(
     system_prompt=None,
     history_messages=None,
     keyword_extraction=False,
+    entity_extraction=False,
     **kwargs,
 ) -> str:
     """Azure OpenAI complete wrapper function.
@@ -966,12 +1174,14 @@ async def azure_openai_complete(
     """
     if history_messages is None:
         history_messages = []
+    entity_extraction = kwargs.pop("entity_extraction", entity_extraction)
     result = await azure_openai_complete_if_cache(
         os.getenv("LLM_MODEL", "gpt-4o-mini"),
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
         keyword_extraction=keyword_extraction,
+        entity_extraction=entity_extraction,
         **kwargs,
     )
     return result

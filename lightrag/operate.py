@@ -1,16 +1,18 @@
 from __future__ import annotations
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
 import asyncio
 import json
+import re
 import json_repair
-from typing import Any, AsyncIterator, overload, Literal
+from typing import Any, AsyncIterator, overload, Literal, Callable, Awaitable
 from collections import Counter, defaultdict
 
 from lightrag.exceptions import (
+    IndexFlushError,
     PipelineCancelledException,
-    ChunkTokenLimitExceededError,
 )
 from lightrag.utils import (
     logger,
@@ -18,6 +20,10 @@ from lightrag.utils import (
     Tokenizer,
     is_float_regex,
     sanitize_and_normalize_extracted_text,
+    sanitize_text_for_encoding,
+    repair_vlm_json_escape_damage_nested,
+    strip_markdown_code_fence,
+    tolerant_load_json_dict,
     pack_user_ass_to_openai_messages,
     split_string_by_multi_markers,
     truncate_list_by_token_size,
@@ -25,7 +31,11 @@ from lightrag.utils import (
     handle_cache,
     save_to_cache,
     CacheData,
+    is_truncated_response,
     use_llm_func_with_cache,
+    get_env_value,
+    get_llm_cache_identity,
+    serialize_llm_cache_identity,
     update_chunk_cache_list,
     remove_think_tags,
     pick_by_weighted_polling,
@@ -40,6 +50,7 @@ from lightrag.utils import (
     merge_source_ids,
     make_relation_chunk_key,
     _cooperative_yield,
+    wait_tasks_with_drain,
     performance_timing_log,
 )
 from lightrag.base import (
@@ -51,23 +62,37 @@ from lightrag.base import (
     QueryResult,
     QueryContextResult,
 )
-from lightrag.prompt import PROMPTS
+from lightrag.chunk_schema import (
+    HEADING_BREADCRUMB_SEP,
+    format_heading_context,
+    format_parent_headings,
+    strip_internal_multimodal_markup_for_extraction,
+)
+from lightrag.prompt import PROMPTS, resolve_entity_extraction_prompt_profile
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
     DEFAULT_MAX_ENTITY_TOKENS,
+    DEFAULT_MAX_EXTRACT_INPUT_TOKENS,
+    DEFAULT_MAX_SECTION_CONTEXT_TOKENS,
     DEFAULT_MAX_RELATION_TOKENS,
     DEFAULT_MAX_TOTAL_TOKENS,
+    DEFAULT_QUERY_PRIORITY,
+    DEFAULT_SUMMARY_PRIORITY,
     DEFAULT_RELATED_CHUNK_NUMBER,
     DEFAULT_KG_CHUNK_PICK_METHOD,
-    DEFAULT_ENTITY_TYPES,
     DEFAULT_SUMMARY_LANGUAGE,
     SOURCE_IDS_LIMIT_METHOD_KEEP,
     SOURCE_IDS_LIMIT_METHOD_FIFO,
     DEFAULT_FILE_PATH_MORE_PLACEHOLDER,
     DEFAULT_MAX_FILE_PATHS,
     DEFAULT_ENTITY_NAME_MAX_LENGTH,
+    DEFAULT_ENTITY_NAME_MAX_BYTES,
 )
-from lightrag.kg.shared_storage import get_storage_keyed_lock
+from lightrag.kg.shared_storage import (
+    PipelineStatusLogger,
+    append_pipeline_history,
+    get_storage_keyed_lock,
+)
 import time
 from dotenv import load_dotenv
 
@@ -77,91 +102,244 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=False)
 
 
-def _truncate_entity_identifier(
-    identifier: str, limit: int, chunk_key: str, identifier_role: str
-) -> str:
-    """Truncate entity identifiers that exceed the configured length limit."""
+class QueryProgress:
+    """Progress event identifiers emitted during the retrieval pipeline.
 
-    if len(identifier) <= limit:
+    These string constants are sent to the frontend via the progress_callback
+    so the UI can show which pipeline step is currently executing.
+    """
+
+    EXTRACTING_KEYWORDS = "extracting_keywords"
+    RETRIEVING_ENTITIES = "retrieving_entities"
+    RETRIEVING_RELATIONS = "retrieving_relations"
+    RETRIEVING_CHUNKS = "retrieving_chunks"
+    RERANKING = "reranking"
+    GENERATING_RESPONSE = "generating_response"
+
+
+# Type alias for the async progress callback: receives a QueryProgress event string.
+ProgressCallback = Callable[[str], Awaitable[None]]
+
+
+KGRebuildPolicy = Literal["best_effort", "rollback"]
+
+
+@dataclass
+class KGRebuildReport:
+    """Non-fatal data-quality gaps observed while rebuilding KG aggregates.
+
+    Missing or unusable extraction material degrades the semantic aggregate,
+    but rollback can still restore the hard provenance invariant by rewriting
+    graph/vector/tracking source IDs to the surviving chunks. Operational
+    storage failures are not represented here; rollback policy propagates
+    those failures so its journal remains retryable.
+
+    Known degradation semantics: a degraded relationship preserves its stored
+    ``weight`` as-is — without per-chunk extraction cache the rolled-back
+    chunk's weight contribution cannot be subtracted (#3399 precision is
+    restored only by a full reprocess). The degradation is recorded in the
+    persisted ``kg_recovery_warnings`` so operators can identify affected
+    aggregates.
+    """
+
+    missing_cache_chunk_ids: set[str] = field(default_factory=set)
+    unusable_cache_chunk_ids: set[str] = field(default_factory=set)
+    referenced_chunk_ids: set[str] = field(default_factory=set)
+    degraded_entities: dict[str, list[str]] = field(default_factory=dict)
+    degraded_relationships: dict[tuple[str, str], list[str]] = field(
+        default_factory=dict
+    )
+
+    @property
+    def has_warnings(self) -> bool:
+        return bool(
+            self.missing_cache_chunk_ids
+            or self.unusable_cache_chunk_ids
+            or self.degraded_entities
+            or self.degraded_relationships
+        )
+
+    @property
+    def surviving_chunk_ids(self) -> set[str]:
+        """Chunk ids involved in a degraded rebuild (owner-lookup scope).
+
+        Every specific bucket (missing/unusable cache, degraded aggregates)
+        is a subset of ``referenced_chunk_ids`` by construction — missing =
+        referenced minus cached, unusable/degraded are recorded per rebuild
+        target — so the union is simply the full referenced set whenever any
+        degradation was recorded, and empty otherwise.
+        """
+        return set(self.referenced_chunk_ids) if self.has_warnings else set()
+
+
+def _get_relationship_vdb_timeout_seconds(global_config: dict[str, Any]) -> float:
+    """Derive a defensive timeout for relation VDB upserts.
+
+    Rationale:
+    - `knowledge_graph_inst.upsert_edge()` for the default NetworkX storage is in-memory and fast.
+    - `relationships_vdb.upsert()` performs embedding calls and remote I/O, which is the more likely
+      point of silent stalls during relation merge.
+    """
+    configured = global_config.get("default_embedding_timeout")
+    try:
+        base_timeout = float(configured)
+    except (TypeError, ValueError):
+        base_timeout = 30.0
+    # Keep a fixed lower bound high enough to avoid false positives on slow providers.
+    return max(base_timeout * 3, 120.0)
+
+
+def _format_relation_edge_label(edge_key: tuple[str, str] | list[str]) -> str:
+    if isinstance(edge_key, tuple):
+        left, right = edge_key
+    else:
+        left, right = edge_key[0], edge_key[1]
+    return f"{left}->{right}"
+
+
+def _truncate_entity_identifier(
+    identifier: str,
+    limit: int,
+    chunk_key: str,
+    identifier_role: str,
+    byte_limit: int = DEFAULT_ENTITY_NAME_MAX_BYTES,
+) -> str:
+    """Truncate entity identifiers that exceed the configured length limit.
+
+    Enforces both a character limit (``limit``) and a UTF-8 byte limit
+    (``byte_limit``). Milvus validates VARCHAR ``max_length`` in BYTES, not
+    characters, so a CJK identifier within the character limit can still
+    overflow the field (e.g. 256 Chinese chars ~= 694 bytes > 512). The byte
+    truncation cuts on a character boundary so the result stays valid UTF-8.
+    """
+
+    char_len = len(identifier)
+    byte_len = len(identifier.encode("utf-8"))
+    if char_len <= limit and byte_len <= byte_limit:
         return identifier
 
     display_value = identifier[:limit]
-    preview = identifier[:20]  # Show first 20 characters as preview
+    encoded = display_value.encode("utf-8")
+    if len(encoded) > byte_limit:
+        # Drop the partial trailing multi-byte char left by the byte slice.
+        display_value = encoded[:byte_limit].decode("utf-8", errors="ignore")
+    preview = identifier[:50]  # Show first 50 characters as preview
     logger.warning(
-        "%s: %s len %d > %d chars (Name: '%s...')",
+        "%s: %s len %d chars / %d bytes > %d chars / %d bytes (Name: '%s...')",
         chunk_key,
         identifier_role,
-        len(identifier),
+        char_len,
+        byte_len,
         limit,
+        byte_limit,
         preview,
     )
     return display_value
 
 
-def chunking_by_token_size(
-    tokenizer: Tokenizer,
-    content: str,
-    split_by_character: str | None = None,
-    split_by_character_only: bool = False,
-    chunk_overlap_token_size: int = 100,
-    chunk_token_size: int = 1200,
-) -> list[dict[str, Any]]:
+def _truncate_section_context(
+    heading_path: str,
+    tokenizer: "Tokenizer | None",
+    max_tokens: int,
+) -> str:
+    """Token-budget the `---Section Context---` breadcrumb before injection.
+
+    The breadcrumb is metadata layered on top of the (already chunk-sized)
+    input text, so an unbounded heading chain could push an otherwise-valid
+    chunk past the provider context window. When the path exceeds ``max_tokens``
+    we first collapse it to the **first** level (top-level document location)
+    and the **last/leaf** level (the chunk's own, most-specific section),
+    eliding the middle with ``first → … → leaf``. A token-dense path (emoji /
+    byte-level tokenizers) can still exceed the budget even with one or two
+    levels, so a hard token cap is always applied as a backstop — the returned
+    string is guaranteed to fit ``max_tokens``. ``max_tokens <= 0`` or a missing
+    tokenizer disables the cap.
+    """
+    if not heading_path or tokenizer is None or max_tokens <= 0:
+        return heading_path
+    if len(tokenizer.encode(heading_path)) <= max_tokens:
+        return heading_path
+    levels = heading_path.split(HEADING_BREADCRUMB_SEP)
+    if len(levels) >= 3:
+        heading_path = (
+            f"{levels[0]}{HEADING_BREADCRUMB_SEP}…{HEADING_BREADCRUMB_SEP}{levels[-1]}"
+        )
+    # Backstop: enforce the cap for token-dense short paths (and any collapsed
+    # form that is still over budget). Prefer a trailing ellipsis when it fits,
+    # but re-encode each candidate because custom/BPE tokenizers may tokenize
+    # the suffix differently when it is appended to decoded prefix text.
+    tokens = tokenizer.encode(heading_path)
+    if len(tokens) > max_tokens:
+        ellipsis = "…"
+        ellipsis_token_count = len(tokenizer.encode(ellipsis))
+        if ellipsis_token_count <= max_tokens:
+            for keep in range(max_tokens - ellipsis_token_count, -1, -1):
+                candidate = tokenizer.decode(tokens[:keep]).rstrip() + ellipsis
+                if len(tokenizer.encode(candidate)) <= max_tokens:
+                    return candidate
+        for keep in range(max_tokens, -1, -1):
+            candidate = tokenizer.decode(tokens[:keep]).rstrip()
+            if len(tokenizer.encode(candidate)) <= max_tokens:
+                return candidate
+        return ""
+    return heading_path
+
+
+def _truncate_vdb_content(content: str, global_config: dict, content_label: str) -> str:
+    """Clamp vector-store payload size to stay under embedding limits."""
+
+    if not content:
+        return content
+
+    embedding_token_limit = global_config.get("embedding_token_limit")
+    tokenizer: Tokenizer | None = global_config.get("tokenizer")
+    if embedding_token_limit is None or tokenizer is None:
+        return content
+
+    threshold = int(embedding_token_limit)
+    if threshold <= 0:
+        return content
+
     tokens = tokenizer.encode(content)
-    results: list[dict[str, Any]] = []
-    if split_by_character:
-        raw_chunks = content.split(split_by_character)
-        new_chunks = []
-        if split_by_character_only:
-            for chunk in raw_chunks:
-                _tokens = tokenizer.encode(chunk)
-                if len(_tokens) > chunk_token_size:
-                    logger.warning(
-                        "Chunk split_by_character exceeds token limit: len=%d limit=%d",
-                        len(_tokens),
-                        chunk_token_size,
-                    )
-                    raise ChunkTokenLimitExceededError(
-                        chunk_tokens=len(_tokens),
-                        chunk_token_limit=chunk_token_size,
-                        chunk_preview=chunk[:120],
-                    )
-                new_chunks.append((len(_tokens), chunk))
-        else:
-            for chunk in raw_chunks:
-                _tokens = tokenizer.encode(chunk)
-                if len(_tokens) > chunk_token_size:
-                    for start in range(
-                        0, len(_tokens), chunk_token_size - chunk_overlap_token_size
-                    ):
-                        chunk_content = tokenizer.decode(
-                            _tokens[start : start + chunk_token_size]
-                        )
-                        new_chunks.append(
-                            (min(chunk_token_size, len(_tokens) - start), chunk_content)
-                        )
-                else:
-                    new_chunks.append((len(_tokens), chunk))
-        for index, (_len, chunk) in enumerate(new_chunks):
-            results.append(
-                {
-                    "tokens": _len,
-                    "content": chunk.strip(),
-                    "chunk_order_index": index,
-                }
-            )
-    else:
-        for index, start in enumerate(
-            range(0, len(tokens), chunk_token_size - chunk_overlap_token_size)
-        ):
-            chunk_content = tokenizer.decode(tokens[start : start + chunk_token_size])
-            results.append(
-                {
-                    "tokens": min(chunk_token_size, len(tokens) - start),
-                    "content": chunk_content.strip(),
-                    "chunk_order_index": index,
-                }
-            )
-    return results
+    if len(tokens) <= threshold:
+        return content
+
+    # Leave headroom because tokenizer behavior can differ slightly from the provider.
+    effective_limit = max(threshold - min(256, max(32, threshold // 16)), 1)
+    truncated_content = tokenizer.decode(tokens[:effective_limit])
+    logger.warning(
+        "%s VDB content truncated from %d to %d tokens (embedding limit: %d)",
+        content_label,
+        len(tokens),
+        effective_limit,
+        threshold,
+    )
+    return truncated_content
+
+
+_MM_DISPLAY_NAME_PATTERN = re.compile(
+    r"^\[(?:Image|Table|Equation) Name\](.+)$",
+    flags=re.MULTILINE,
+)
+
+
+def _parse_mm_display_name(content: str, fallback: str) -> str:
+    """Return the friendly name embedded in a multimodal chunk.
+
+    Matches the leading ``[Image Name]…`` / ``[Table Name]…`` /
+    ``[Equation Name]…`` segment produced by
+    ``LightRAG._build_mm_chunks_from_sidecars`` — the producer-side
+    contract is documented in that function's ``_render`` helper. Falls
+    back to the sidecar id when the segment is missing or empty so
+    callers never end up with a blank label.
+    """
+    if content:
+        match = _MM_DISPLAY_NAME_PATTERN.search(content)
+        if match:
+            candidate = match.group(1).strip()
+            if candidate:
+                return candidate
+    return fallback
 
 
 async def _handle_entity_relation_summary(
@@ -195,8 +373,11 @@ async def _handle_entity_relation_summary(
         return "", False
 
     # If only one description, return it directly (no need for LLM call)
+    # Still sanitize: descriptions read back from existing graph nodes (or
+    # injected by non-extraction producers) may carry XML-illegal control
+    # characters that would crash the GraphML flush downstream.
     if len(description_list) == 1:
-        return description_list[0], False
+        return sanitize_text_for_encoding(description_list[0]), False
 
     # Get configuration
     tokenizer: Tokenizer = global_config["tokenizer"]
@@ -212,8 +393,13 @@ async def _handle_entity_relation_summary(
         # Calculate total tokens in current list while periodically yielding so
         # a large merge does not monopolize the event loop in single-worker mode.
         total_tokens = 0
+        # Tokenize each description once; the chunk-building pass below
+        # reuses these counts instead of re-encoding the same strings.
+        desc_token_counts = []
         for i, desc in enumerate(current_list, start=1):
-            total_tokens += len(tokenizer.encode(desc))
+            tokens = len(tokenizer.encode(desc))
+            desc_token_counts.append(tokens)
+            total_tokens += tokens
             await _cooperative_yield(i, every=32)
 
         # If total length is within limits, perform final summarization
@@ -223,7 +409,12 @@ async def _handle_entity_relation_summary(
                 and total_tokens < summary_max_tokens
             ):
                 # no LLM needed, just join the descriptions
-                final_description = separator.join(current_list)
+                # Sanitize for the same reason as the single-description
+                # early return above: inputs merged from pre-existing graph
+                # data are not guaranteed XML-safe.
+                final_description = sanitize_text_for_encoding(
+                    separator.join(current_list)
+                )
                 return final_description if final_description else "", llm_was_used
             else:
                 if total_tokens > summary_context_size and len(current_list) <= 2:
@@ -246,9 +437,12 @@ async def _handle_entity_relation_summary(
         current_chunk = []
         current_tokens = 0
 
-        # Currently least 3 descriptions in current_list
-        for i, desc in enumerate(current_list, start=1):
-            desc_tokens = len(tokenizer.encode(desc))
+        # Currently least 3 descriptions in current_list.
+        # Reuse the per-description token counts computed above instead of
+        # re-encoding every description a second time.
+        for i, (desc, desc_tokens) in enumerate(
+            zip(current_list, desc_token_counts), start=1
+        ):
             await _cooperative_yield(i, every=32)
 
             # If adding current description would exceed limit, finalize current chunk
@@ -319,11 +513,14 @@ async def _summarize_descriptions(
     Returns:
         Summarized description string
     """
-    use_llm_func: callable = global_config["llm_model_func"]
+    use_llm_func: callable = global_config["role_llm_funcs"]["extract"]
     # Apply higher priority (8) to entity/relation summary tasks
-    use_llm_func = partial(use_llm_func, _priority=8)
+    use_llm_func = partial(use_llm_func, _priority=DEFAULT_SUMMARY_PRIORITY)
 
-    language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
+    addon_params = global_config.get("addon_params") or {}
+    language = global_config.get("_resolved_summary_language")
+    if language is None:
+        language = addon_params.get("language", DEFAULT_SUMMARY_LANGUAGE)
 
     summary_length_recommended = global_config["summary_length_recommended"]
 
@@ -365,7 +562,14 @@ async def _summarize_descriptions(
         use_llm_func,
         llm_response_cache=llm_response_cache,
         cache_type="summary",
+        llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
     )
+
+    # The LLM response is the only description path that bypasses
+    # extraction-time sanitization; control chars / surrogates left here
+    # would later break GraphML (XML) serialization on write. Strip them
+    # at the source, symmetric with how extracted descriptions are cleaned.
+    summary = sanitize_text_for_encoding(summary)
 
     # Check summary token length against embedding limit
     embedding_token_limit = global_config.get("embedding_token_limit")
@@ -557,6 +761,238 @@ def _handle_single_relationship_extraction(
         return None
 
 
+def _normalize_text_extraction_record_attributes(
+    record_attributes: list[str], chunk_key: str
+) -> list[str]:
+    """Recover the known text-mode failure where relation rows use the entity prefix."""
+
+    if len(record_attributes) != 5:
+        return record_attributes
+
+    prefix = record_attributes[0].strip().lower()
+    if "entity" not in prefix or "relation" in prefix:
+        return record_attributes
+
+    logger.warning(
+        "Recovering mis-prefixed relation: `%s` ~ `%s`",
+        record_attributes[1],
+        record_attributes[2],
+    )
+    normalized = list(record_attributes)
+    normalized[0] = "relation"
+    return normalized
+
+
+def _looks_like_json_extraction_result(result: str) -> bool:
+    """Return True for raw or fenced JSON extraction responses."""
+
+    stripped = result.strip()
+    if not stripped:
+        return False
+
+    if stripped.startswith(("{", "[")):
+        return True
+
+    if stripped.startswith("```"):
+        return strip_markdown_code_fence(stripped).strip().startswith(("{", "["))
+
+    return False
+
+
+async def _process_json_extraction_result(
+    result: str,
+    chunk_key: str,
+    timestamp: int,
+    file_path: str = "unknown_source",
+) -> tuple[dict, dict]:
+    """Process a JSON-formatted extraction result from LLM.
+
+    This function parses the LLM response as JSON and extracts entities and relationships.
+    It uses :func:`tolerant_load_json_dict` to recover JSON from fenced,
+    prose-wrapped, or slightly malformed responses from weaker models.
+
+    Args:
+        result: The JSON extraction result from LLM
+        chunk_key: The chunk key for source tracking
+        timestamp: The timestamp for the extraction
+        file_path: The file path for citation
+
+    Returns:
+        tuple: (nodes_dict, edges_dict) containing the extracted entities and relationships
+    """
+    maybe_nodes = defaultdict(list)
+    maybe_edges = defaultdict(list)
+
+    # tolerant_load_json_dict strips fences, tolerates leading/trailing prose
+    # (including trailing braces), and repairs the malformed-object slips
+    # json_repair fixes. It never raises and returns {} for unparseable input or
+    # a top-level array (callers require exactly one object). Note: because the
+    # helper absorbs the underlying parse exception, only this single "empty or
+    # unrecoverable" warning is logged — the low-level decode error is no longer
+    # surfaced.
+    parsed = tolerant_load_json_dict(result)
+    if not parsed:
+        logger.warning(f"{chunk_key}: JSON extraction result is empty or unrecoverable")
+        return dict(maybe_nodes), dict(maybe_edges)
+
+    # Models quoting LaTeX in descriptions routinely under-escape backslashes
+    # ("\frac" is valid JSON meaning form feed + "rac"); restore the zero-risk
+    # cases before sanitization would otherwise delete the control characters
+    # and leave a maimed formula. Covers initial extraction, gleaning, and
+    # cache-rebuild — all three flow through this parser.
+    parsed = repair_vlm_json_escape_damage_nested(parsed, context=chunk_key)
+
+    # Process entities
+    entities_list = parsed.get("entities", [])
+    if not isinstance(entities_list, list):
+        logger.warning(
+            f"{chunk_key}: 'entities' field is not a list in JSON extraction result"
+        )
+        entities_list = []
+
+    for entity_data in entities_list:
+        if not isinstance(entity_data, dict):
+            continue
+
+        try:
+            entity_name = sanitize_and_normalize_extracted_text(
+                str(entity_data.get("name", "")), remove_inner_quotes=True
+            )
+            if not entity_name or not entity_name.strip():
+                logger.info(
+                    f"{chunk_key}: Empty entity name found after sanitization in JSON result"
+                )
+                continue
+
+            entity_type = sanitize_and_normalize_extracted_text(
+                str(entity_data.get("type", "")), remove_inner_quotes=True
+            )
+            if not entity_type.strip() or any(
+                char in entity_type
+                for char in ["'", "(", ")", "<", ">", "|", "/", "\\"]
+            ):
+                logger.warning(
+                    f"{chunk_key}: Invalid entity type '{entity_type}' for entity '{entity_name}'"
+                )
+                continue
+
+            entity_type = entity_type.replace(" ", "").lower()
+
+            entity_description = sanitize_and_normalize_extracted_text(
+                str(entity_data.get("description", ""))
+            )
+            if not entity_description.strip():
+                logger.warning(
+                    f"{chunk_key}: Empty description for entity '{entity_name}'"
+                )
+                continue
+
+            truncated_name = _truncate_entity_identifier(
+                entity_name,
+                DEFAULT_ENTITY_NAME_MAX_LENGTH,
+                chunk_key,
+                "Entity name",
+            )
+
+            node_data = dict(
+                entity_name=truncated_name,
+                entity_type=entity_type,
+                description=entity_description,
+                source_id=chunk_key,
+                file_path=file_path,
+                timestamp=timestamp,
+            )
+            maybe_nodes[truncated_name].append(node_data)
+
+        except Exception as e:
+            logger.warning(
+                f"{chunk_key}: Failed to process entity from JSON result: {e}"
+            )
+            continue
+
+    # Process relationships
+    relationships_list = parsed.get("relationships", [])
+    if not isinstance(relationships_list, list):
+        logger.warning(
+            f"{chunk_key}: 'relationships' field is not a list in JSON extraction result"
+        )
+        relationships_list = []
+
+    for rel_data in relationships_list:
+        if not isinstance(rel_data, dict):
+            continue
+
+        try:
+            source = sanitize_and_normalize_extracted_text(
+                str(rel_data.get("source", "")), remove_inner_quotes=True
+            )
+            target = sanitize_and_normalize_extracted_text(
+                str(rel_data.get("target", "")), remove_inner_quotes=True
+            )
+
+            if not source:
+                logger.info(
+                    f"{chunk_key}: Empty source entity in JSON relationship result"
+                )
+                continue
+            if not target:
+                logger.info(
+                    f"{chunk_key}: Empty target entity in JSON relationship result"
+                )
+                continue
+            if source == target:
+                logger.debug(f"{chunk_key}: Source and target are the same: '{source}'")
+                continue
+
+            edge_keywords = sanitize_and_normalize_extracted_text(
+                str(rel_data.get("keywords", "")), remove_inner_quotes=True
+            )
+            edge_keywords = edge_keywords.replace("，", ",")
+
+            edge_description = sanitize_and_normalize_extracted_text(
+                str(rel_data.get("description", ""))
+            )
+
+            if not edge_description.strip():
+                logger.warning(
+                    f"{chunk_key}: Empty description for relationship '{source}' ~ '{target}', skipping"
+                )
+                continue
+
+            truncated_source = _truncate_entity_identifier(
+                source,
+                DEFAULT_ENTITY_NAME_MAX_LENGTH,
+                chunk_key,
+                "Relation entity",
+            )
+            truncated_target = _truncate_entity_identifier(
+                target,
+                DEFAULT_ENTITY_NAME_MAX_LENGTH,
+                chunk_key,
+                "Relation entity",
+            )
+
+            edge_data = dict(
+                src_id=truncated_source,
+                tgt_id=truncated_target,
+                weight=1.0,
+                description=edge_description,
+                keywords=edge_keywords,
+                source_id=chunk_key,
+                file_path=file_path,
+                timestamp=timestamp,
+            )
+            maybe_edges[(truncated_source, truncated_target)].append(edge_data)
+
+        except Exception as e:
+            logger.warning(
+                f"{chunk_key}: Failed to process relationship from JSON result: {e}"
+            )
+            continue
+
+    return dict(maybe_nodes), dict(maybe_edges)
+
+
 async def rebuild_knowledge_from_chunks(
     entities_to_rebuild: dict[str, list[str]],
     relationships_to_rebuild: dict[tuple[str, str], list[str]],
@@ -570,7 +1006,8 @@ async def rebuild_knowledge_from_chunks(
     pipeline_status_lock=None,
     entity_chunks_storage: BaseKVStorage | None = None,
     relation_chunks_storage: BaseKVStorage | None = None,
-) -> None:
+    rebuild_policy: KGRebuildPolicy = "best_effort",
+) -> KGRebuildReport:
     """Rebuild entity and relationship descriptions from cached extraction results with parallel processing
 
     This method uses cached LLM extraction results instead of calling LLM again,
@@ -590,9 +1027,24 @@ async def rebuild_knowledge_from_chunks(
         pipeline_status_lock: Lock for pipeline status
         entity_chunks_storage: KV storage maintaining full chunk IDs per entity
         relation_chunks_storage: KV storage maintaining full chunk IDs per relation
+        rebuild_policy: ``best_effort`` preserves historical exception
+            handling for ordinary deletion. ``rollback`` treats missing or
+            unusable extraction data as a non-fatal semantic degradation and
+            structurally rewrites provenance from the surviving chunks, while
+            propagating operational graph/vector/tracking failures so the
+            rollback journal remains retryable.
     """
+    if rebuild_policy not in ("best_effort", "rollback"):
+        raise ValueError(f"Unsupported KG rebuild policy: {rebuild_policy}")
+
+    report = KGRebuildReport()
     if not entities_to_rebuild and not relationships_to_rebuild:
-        return
+        return report
+
+    # Operation-scoped status logger for per-item FAILURE messages: errors must
+    # stay visible in the pipeline history (the WebUI reads it), while per-item
+    # success/completion detail goes to the backend log only (volume control).
+    status_logger = PipelineStatusLogger(pipeline_status)
 
     # Get all referenced chunk IDs
     all_referenced_chunk_ids = set()
@@ -600,30 +1052,46 @@ async def rebuild_knowledge_from_chunks(
         all_referenced_chunk_ids.update(chunk_ids)
     for chunk_ids in relationships_to_rebuild.values():
         all_referenced_chunk_ids.update(chunk_ids)
+    report.referenced_chunk_ids.update(all_referenced_chunk_ids)
 
     status_message = f"Rebuilding knowledge from {len(all_referenced_chunk_ids)} cached chunk extractions (parallel processing)"
     logger.info(status_message)
     if pipeline_status is not None and pipeline_status_lock is not None:
         async with pipeline_status_lock:
             pipeline_status["latest_message"] = status_message
-            pipeline_status["history_messages"].append(status_message)
+            append_pipeline_history(pipeline_status, status_message)
 
     # Get cached extraction results for these chunks using storage
     # cached_results： chunk_id -> [list of (extraction_result, create_time) from LLM cache sorted by create_time of the first extraction_result]
-    cached_results = await _get_cached_extraction_results(
+    cached_results, chunk_data_by_id = await _get_cached_extraction_results(
         llm_response_cache,
         all_referenced_chunk_ids,
         text_chunks_storage=text_chunks_storage,
     )
 
-    if not cached_results:
-        status_message = "No cached extraction results found, cannot rebuild"
+    missing_chunk_ids = all_referenced_chunk_ids - set(cached_results.keys())
+    report.missing_cache_chunk_ids.update(missing_chunk_ids)
+    if missing_chunk_ids:
+        status_message = (
+            f"Extraction cache missing for {len(missing_chunk_ids)} of "
+            f"{len(all_referenced_chunk_ids)} referenced chunk(s); "
+            "rebuild may use structural fallback"
+        )
         logger.warning(status_message)
         if pipeline_status is not None and pipeline_status_lock is not None:
             async with pipeline_status_lock:
                 pipeline_status["latest_message"] = status_message
-                pipeline_status["history_messages"].append(status_message)
-        return
+                append_pipeline_history(pipeline_status, status_message)
+
+    if not cached_results:
+        status_message = "No cached extraction results found"
+        logger.warning(status_message)
+        if pipeline_status is not None and pipeline_status_lock is not None:
+            async with pipeline_status_lock:
+                pipeline_status["latest_message"] = status_message
+                append_pipeline_history(pipeline_status, status_message)
+        if rebuild_policy == "best_effort":
+            return report
 
     # Process cached results to get entities and relationships for each chunk
     chunk_entities = {}  # chunk_id -> {entity_name: [entity_data]}
@@ -642,6 +1110,7 @@ async def rebuild_knowledge_from_chunks(
                     chunk_id=chunk_id,
                     extraction_result=result[0],
                     timestamp=result[1],
+                    chunk_data=chunk_data_by_id.get(chunk_id),
                 )
 
                 # Merge entities and relationships from this extraction result
@@ -692,14 +1161,12 @@ async def rebuild_knowledge_from_chunks(
                         # Otherwise keep existing version
 
         except Exception as e:
+            report.unusable_cache_chunk_ids.add(chunk_id)
             status_message = (
                 f"Failed to parse cached extraction result for chunk {chunk_id}: {e}"
             )
-            logger.info(status_message)  # Per requirement, change to info
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    pipeline_status["latest_message"] = status_message
-                    pipeline_status["history_messages"].append(status_message)
+            logger.warning(status_message)
+            status_logger.log(status_message)
             continue
 
     # Get max async tasks limit from global_config for semaphore control
@@ -711,6 +1178,7 @@ async def rebuild_knowledge_from_chunks(
     rebuilt_relationships_count = 0
     failed_entities_count = 0
     failed_relationships_count = 0
+    structural_fallback = rebuild_policy == "rollback"
 
     async def _locked_rebuild_entity(entity_name, chunk_ids):
         nonlocal rebuilt_entities_count, failed_entities_count
@@ -721,7 +1189,7 @@ async def rebuild_knowledge_from_chunks(
                 [entity_name], namespace=namespace, enable_logging=False
             ):
                 try:
-                    await _rebuild_single_entity(
+                    degraded = await _rebuild_single_entity(
                         knowledge_graph_inst=knowledge_graph_inst,
                         entities_vdb=entities_vdb,
                         entity_name=entity_name,
@@ -730,16 +1198,21 @@ async def rebuild_knowledge_from_chunks(
                         llm_response_cache=llm_response_cache,
                         global_config=global_config,
                         entity_chunks_storage=entity_chunks_storage,
+                        chunk_data_by_id=chunk_data_by_id,
+                        structural_fallback=structural_fallback,
                     )
                     rebuilt_entities_count += 1
+                    if degraded:
+                        report.degraded_entities[entity_name] = list(chunk_ids)
                 except Exception as e:
                     failed_entities_count += 1
                     status_message = f"Failed to rebuild `{entity_name}`: {e}"
-                    logger.info(status_message)  # Per requirement, change to info
-                    if pipeline_status is not None and pipeline_status_lock is not None:
-                        async with pipeline_status_lock:
-                            pipeline_status["latest_message"] = status_message
-                            pipeline_status["history_messages"].append(status_message)
+                    logger.info(status_message)
+                    status_logger.log(status_message)
+                    if rebuild_policy == "rollback":
+                        # A real storage/rebuild failure is retryable and must
+                        # retain the custom-chunk journal.
+                        raise
 
     async def _locked_rebuild_relationship(src, tgt, chunk_ids):
         nonlocal rebuilt_relationships_count, failed_relationships_count
@@ -754,7 +1227,7 @@ async def rebuild_knowledge_from_chunks(
                 enable_logging=False,
             ):
                 try:
-                    await _rebuild_single_relationship(
+                    degraded = await _rebuild_single_relationship(
                         knowledge_graph_inst=knowledge_graph_inst,
                         relationships_vdb=relationships_vdb,
                         entities_vdb=entities_vdb,
@@ -766,18 +1239,21 @@ async def rebuild_knowledge_from_chunks(
                         global_config=global_config,
                         relation_chunks_storage=relation_chunks_storage,
                         entity_chunks_storage=entity_chunks_storage,
-                        pipeline_status=pipeline_status,
-                        pipeline_status_lock=pipeline_status_lock,
+                        chunk_data_by_id=chunk_data_by_id,
+                        structural_fallback=structural_fallback,
                     )
                     rebuilt_relationships_count += 1
+                    if degraded:
+                        report.degraded_relationships[(src, tgt)] = list(chunk_ids)
                 except Exception as e:
                     failed_relationships_count += 1
                     status_message = f"Failed to rebuild `{src}`~`{tgt}`: {e}"
-                    logger.info(status_message)  # Per requirement, change to info
-                    if pipeline_status is not None and pipeline_status_lock is not None:
-                        async with pipeline_status_lock:
-                            pipeline_status["latest_message"] = status_message
-                            pipeline_status["history_messages"].append(status_message)
+                    logger.info(status_message)
+                    status_logger.log(status_message)
+                    if rebuild_policy == "rollback":
+                        # A real storage/rebuild failure is retryable and must
+                        # retain the custom-chunk journal.
+                        raise
 
     # Create tasks for parallel processing
     tasks = []
@@ -798,39 +1274,12 @@ async def rebuild_knowledge_from_chunks(
     if pipeline_status is not None and pipeline_status_lock is not None:
         async with pipeline_status_lock:
             pipeline_status["latest_message"] = status_message
-            pipeline_status["history_messages"].append(status_message)
+            append_pipeline_history(pipeline_status, status_message)
 
-    # Execute all tasks in parallel with semaphore control and early failure detection
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-
-    # Check if any task raised an exception and ensure all exceptions are retrieved
-    first_exception = None
-
-    for task in done:
-        try:
-            exception = task.exception()
-            if exception is not None:
-                if first_exception is None:
-                    first_exception = exception
-            else:
-                # Task completed successfully, retrieve result to mark as processed
-                task.result()
-        except Exception as e:
-            if first_exception is None:
-                first_exception = e
-
-    # If any task failed, cancel all pending tasks and raise the first exception
-    if first_exception is not None:
-        # Cancel all pending tasks
-        for pending_task in pending:
-            pending_task.cancel()
-
-        # Wait for cancellation to complete
-        if pending:
-            await asyncio.wait(pending)
-
-        # Re-raise the first exception to notify the caller
-        raise first_exception
+    # Execute all tasks in parallel with semaphore control; on any failure
+    # every sibling is cancelled and drained before the first exception
+    # propagates (no background rebuild writes survive failure handling).
+    await wait_tasks_with_drain(tasks, context="KG rebuild")
 
     # Final status report
     status_message = f"KG rebuild completed: {rebuilt_entities_count} entities and {rebuilt_relationships_count} relationships rebuilt successfully."
@@ -841,14 +1290,27 @@ async def rebuild_knowledge_from_chunks(
     if pipeline_status is not None and pipeline_status_lock is not None:
         async with pipeline_status_lock:
             pipeline_status["latest_message"] = status_message
-            pipeline_status["history_messages"].append(status_message)
+            append_pipeline_history(pipeline_status, status_message)
+
+    if report.has_warnings:
+        logger.warning(
+            "KG rebuild completed with degraded recovery: "
+            "missing_cache_chunks=%d unusable_cache_chunks=%d "
+            "entities=%d relationships=%d",
+            len(report.missing_cache_chunk_ids),
+            len(report.unusable_cache_chunk_ids),
+            len(report.degraded_entities),
+            len(report.degraded_relationships),
+        )
+
+    return report
 
 
 async def _get_cached_extraction_results(
     llm_response_cache: BaseKVStorage,
     chunk_ids: set[str],
     text_chunks_storage: BaseKVStorage,
-) -> dict[str, list[str]]:
+) -> tuple[dict[str, list[tuple[str, int]]], dict[str, dict[str, Any]]]:
     """Get cached extraction results for specific chunk IDs
 
     This function retrieves cached LLM extraction results for the given chunk IDs and returns
@@ -862,19 +1324,21 @@ async def _get_cached_extraction_results(
         text_chunks_storage: Text chunks storage for retrieving chunk data and LLM cache references
 
     Returns:
-        Dict mapping chunk_id -> list of extraction_result_text, where:
-        - Keys (chunk_ids) are ordered by the create_time of their first extraction result
-        - Values (extraction results) are ordered by create_time within each chunk
+        A tuple containing the cache results grouped by chunk ID and the
+        corresponding text-chunk rows used for provenance fallback.
     """
     cached_results = {}
+    chunk_data_by_id: dict[str, dict[str, Any]] = {}
 
     # Collect all LLM cache IDs from chunks
     all_cache_ids = set()
 
     # Read from storage
-    chunk_data_list = await text_chunks_storage.get_by_ids(list(chunk_ids))
-    for chunk_data in chunk_data_list:
+    requested_chunk_ids = list(chunk_ids)
+    chunk_data_list = await text_chunks_storage.get_by_ids(requested_chunk_ids)
+    for chunk_id, chunk_data in zip(requested_chunk_ids, chunk_data_list):
         if chunk_data and isinstance(chunk_data, dict):
+            chunk_data_by_id[chunk_id] = chunk_data
             llm_cache_list = chunk_data.get("llm_cache_list", [])
             if llm_cache_list:
                 all_cache_ids.update(llm_cache_list)
@@ -883,7 +1347,7 @@ async def _get_cached_extraction_results(
 
     if not all_cache_ids:
         logger.warning(f"No LLM cache IDs found for {len(chunk_ids)} chunk IDs")
-        return cached_results
+        return cached_results, chunk_data_by_id
 
     # Batch get LLM cache entries
     cache_data_list = await llm_response_cache.get_by_ids(list(all_cache_ids))
@@ -931,7 +1395,8 @@ async def _get_cached_extraction_results(
     logger.info(
         f"Found {valid_entries} valid cache entries, {len(sorted_cached_results)} chunks with results"
     )
-    return sorted_cached_results  # each item: list(extraction_result, create_time)
+    # each cache item is (extraction_result, create_time)
+    return sorted_cached_results, chunk_data_by_id
 
 
 async def _process_extraction_result(
@@ -1020,6 +1485,9 @@ async def _process_extraction_result(
             )
 
         record_attributes = split_string_by_multi_markers(record, [tuple_delimiter])
+        record_attributes = _normalize_text_extraction_record_attributes(
+            record_attributes, chunk_key
+        )
 
         # Try to parse as entity
         entity_data = _handle_single_entity_extraction(
@@ -1067,8 +1535,13 @@ async def _rebuild_from_extraction_result(
     extraction_result: str,
     chunk_id: str,
     timestamp: int,
+    chunk_data: dict[str, Any] | None = None,
 ) -> tuple[dict, dict]:
-    """Parse cached extraction result using the same logic as extract_entities
+    """Parse cached extraction result using the same logic as extract_entities.
+
+    Supports both JSON and delimiter-based formats for backward compatibility.
+    Attempts JSON parsing first; if the cached result looks like JSON (starts with '{'),
+    uses the JSON parser. Otherwise, falls back to the traditional delimiter-based parser.
 
     Args:
         text_chunks_storage: Text chunks storage to get chunk data
@@ -1080,14 +1553,29 @@ async def _rebuild_from_extraction_result(
     """
 
     # Get chunk data for file_path from storage
-    chunk_data = await text_chunks_storage.get_by_id(chunk_id)
+    if chunk_data is None:
+        chunk_data = await text_chunks_storage.get_by_id(chunk_id)
     file_path = (
         chunk_data.get("file_path", "unknown_source")
         if chunk_data
         else "unknown_source"
     )
 
-    # Call the shared processing function
+    # Auto-detect format: try JSON first if the result looks like JSON
+    if _looks_like_json_extraction_result(extraction_result):
+        # Likely JSON format (from entity_extraction_use_json mode)
+        nodes, edges = await _process_json_extraction_result(
+            extraction_result,
+            chunk_id,
+            timestamp,
+            file_path,
+        )
+        # If JSON parsing yielded results, use them
+        if nodes or edges:
+            return nodes, edges
+        # Otherwise fall through to text-based parsing
+
+    # Fall back to traditional delimiter-based parsing
     return await _process_extraction_result(
         extraction_result,
         chunk_id,
@@ -1096,6 +1584,40 @@ async def _rebuild_from_extraction_result(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
     )
+
+
+def _surviving_chunk_file_paths(
+    chunk_ids: list[str],
+    chunk_data_by_id: dict[str, dict[str, Any]],
+    global_config: dict[str, Any],
+) -> list[str]:
+    """Return bounded, order-preserving file paths for surviving chunks."""
+    file_paths = list(
+        dict.fromkeys(
+            str(chunk_data_by_id[chunk_id]["file_path"])
+            for chunk_id in chunk_ids
+            if chunk_id in chunk_data_by_id
+            and chunk_data_by_id[chunk_id].get("file_path")
+        )
+    )
+    max_file_paths = global_config.get("max_file_paths", DEFAULT_MAX_FILE_PATHS)
+    if len(file_paths) <= max_file_paths:
+        return file_paths
+
+    limit_method = (
+        global_config.get("source_ids_limit_method") or SOURCE_IDS_LIMIT_METHOD_KEEP
+    )
+    if limit_method == SOURCE_IDS_LIMIT_METHOD_FIFO:
+        limited = file_paths[-max_file_paths:]
+    else:
+        limited = file_paths[:max_file_paths]
+    placeholder = global_config.get(
+        "file_path_more_placeholder", DEFAULT_FILE_PATH_MORE_PLACEHOLDER
+    )
+    limited.append(
+        f"...{placeholder}...({limit_method} {max_file_paths}/{len(file_paths)})"
+    )
+    return limited
 
 
 async def _rebuild_single_entity(
@@ -1107,15 +1629,15 @@ async def _rebuild_single_entity(
     llm_response_cache: BaseKVStorage,
     global_config: dict[str, str],
     entity_chunks_storage: BaseKVStorage | None = None,
-    pipeline_status: dict | None = None,
-    pipeline_status_lock=None,
-) -> None:
+    chunk_data_by_id: dict[str, dict[str, Any]] | None = None,
+    structural_fallback: bool = False,
+) -> bool:
     """Rebuild a single entity from cached extraction results"""
 
     # Get current entity data
     current_entity = await knowledge_graph_inst.get_node(entity_name)
     if not current_entity:
-        return
+        return False
 
     # Helper function to update entity in both graph and vector storage
     async def _update_entity_storage(
@@ -1142,7 +1664,11 @@ async def _rebuild_single_entity(
 
             # Update entity in vector database (equally critical)
             entity_vdb_id = compute_mdhash_id(entity_name, prefix="ent-")
-            entity_content = f"{entity_name}\n{final_description}"
+            entity_content = _truncate_vdb_content(
+                f"{entity_name}\n{final_description}",
+                global_config,
+                f"entity:{entity_name}",
+            )
 
             vdb_data = {
                 entity_vdb_id: {
@@ -1200,6 +1726,23 @@ async def _rebuild_single_entity(
             all_entity_data.extend(chunk_entities[chunk_id][entity_name])
 
     if not all_entity_data:
+        if structural_fallback:
+            logger.warning(
+                "No cached entity data found for `%s`; preserving semantic "
+                "fields while repairing provenance",
+                entity_name,
+            )
+            file_paths = _surviving_chunk_file_paths(
+                limited_chunk_ids, chunk_data_by_id or {}, global_config
+            )
+            await _update_entity_storage(
+                current_entity.get("description", ""),
+                current_entity.get("entity_type", "UNKNOWN"),
+                file_paths,
+                limited_chunk_ids,
+            )
+            return True
+
         logger.warning(
             f"No entity data found for `{entity_name}`, trying to rebuild from relationships"
         )
@@ -1208,7 +1751,7 @@ async def _rebuild_single_entity(
         edges = await knowledge_graph_inst.get_node_edges(entity_name)
         if not edges:
             logger.warning(f"No relations attached to entity `{entity_name}`")
-            return
+            return False
 
         # Collect relationship data to extract entity information
         relationship_descriptions = []
@@ -1248,7 +1791,7 @@ async def _rebuild_single_entity(
             file_paths,
             limited_chunk_ids,
         )
-        return
+        return False
 
     # Process cached entity data
     descriptions = []
@@ -1329,16 +1872,14 @@ async def _rebuild_single_entity(
         truncation_info,
     )
 
-    # Log rebuild completion with truncation info
+    # Log rebuild completion with truncation info. Per-item detail goes to the
+    # backend log only; pipeline history keeps the rebuild summary (volume
+    # control).
     status_message = f"Rebuild `{entity_name}` from {len(chunk_ids)} chunks"
     if truncation_info:
         status_message += f" ({truncation_info})"
     logger.info(status_message)
-    # Update pipeline status
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status["latest_message"] = status_message
-            pipeline_status["history_messages"].append(status_message)
+    return False
 
 
 async def _rebuild_single_relationship(
@@ -1353,9 +1894,9 @@ async def _rebuild_single_relationship(
     global_config: dict[str, str],
     relation_chunks_storage: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
-    pipeline_status: dict | None = None,
-    pipeline_status_lock=None,
-) -> None:
+    chunk_data_by_id: dict[str, dict[str, Any]] | None = None,
+    structural_fallback: bool = False,
+) -> bool:
     """Rebuild a single relationship from cached extraction results
 
     Note: This function assumes the caller has already acquired the appropriate
@@ -1365,7 +1906,7 @@ async def _rebuild_single_relationship(
     # Get current relationship data
     current_relationship = await knowledge_graph_inst.get_edge(src, tgt)
     if not current_relationship:
-        return
+        return False
 
     # normalized_chunk_ids = merge_source_ids([], chunk_ids)
     normalized_chunk_ids = chunk_ids
@@ -1402,17 +1943,34 @@ async def _rebuild_single_relationship(
                         chunk_relationships[chunk_id][edge_key]
                     )
 
-    if not all_relationship_data:
+    degraded = not all_relationship_data
+    if degraded and not structural_fallback:
         logger.warning(f"No relation data found for `{src}-{tgt}`")
-        return
+        return False
+
+    if degraded:
+        logger.warning(
+            "No cached relation data found for `%s`~`%s`; preserving semantic "
+            "fields while repairing provenance",
+            src,
+            tgt,
+        )
 
     # Merge descriptions and keywords
-    descriptions = []
-    keywords = []
-    weights = []
-    file_paths_list = []
+    descriptions = [current_relationship.get("description", "")] if degraded else []
+    keywords = [current_relationship.get("keywords", "")] if degraded else []
+    weights = [current_relationship.get("weight", 1.0)] if degraded else []
+    file_paths_list = (
+        _surviving_chunk_file_paths(
+            limited_chunk_ids, chunk_data_by_id or {}, global_config
+        )
+        if degraded
+        else []
+    )
     seen_paths = set()
 
+    # ``all_relationship_data`` is empty by definition when ``degraded``
+    # (degraded == not all_relationship_data), so no guard is needed here.
     for rel_data in all_relationship_data:
         if rel_data.get("description"):
             descriptions.append(rel_data["description"])
@@ -1462,7 +2020,9 @@ async def _rebuild_single_relationship(
     weight = sum(weights) if weights else current_relationship.get("weight", 1.0)
 
     # Generate final description from relations or fallback to current
-    if description_list:
+    if degraded:
+        final_description = current_relationship.get("description", "")
+    elif description_list:
         final_description, _ = await _handle_entity_relation_summary(
             "Relation",
             f"{src}-{tgt}",
@@ -1535,7 +2095,11 @@ async def _rebuild_single_relationship(
             # Update entity_vdb for the newly created entity
             if entities_vdb is not None:
                 entity_vdb_id = compute_mdhash_id(node_id, prefix="ent-")
-                entity_content = f"{node_id}\n{node_description}"
+                entity_content = _truncate_vdb_content(
+                    f"{node_id}\n{node_description}",
+                    global_config,
+                    f"entity:{node_id}",
+                )
                 vdb_data = {
                     entity_vdb_id: {
                         "content": entity_content,
@@ -1567,6 +2131,8 @@ async def _rebuild_single_relationship(
         try:
             await relationships_vdb.delete([rel_vdb_id, rel_vdb_id_reverse])
         except Exception as e:
+            if structural_fallback:
+                raise
             logger.debug(
                 f"Could not delete old relationship vector records {rel_vdb_id}, {rel_vdb_id_reverse}: {e}"
             )
@@ -1600,7 +2166,9 @@ async def _rebuild_single_relationship(
         logger.error(error_msg)
         raise  # Re-raise exception
 
-    # Log rebuild completion with truncation info
+    # Log rebuild completion with truncation info. Per-item detail goes to the
+    # backend log only; pipeline history keeps the rebuild summary (volume
+    # control).
     status_message = f"Rebuild `{src}`~`{tgt}` from {len(chunk_ids)} chunks"
     if truncation_info:
         status_message += f" ({truncation_info})"
@@ -1612,12 +2180,52 @@ async def _rebuild_single_relationship(
         status_message += truncation_info
 
     logger.info(status_message)
+    return degraded
 
-    # Update pipeline status
-    if pipeline_status is not None and pipeline_status_lock is not None:
-        async with pipeline_status_lock:
-            pipeline_status["latest_message"] = status_message
-            pipeline_status["history_messages"].append(status_message)
+
+def _combine_descriptions_dedup(
+    already_description: list[str], new_descriptions: list[str]
+) -> tuple[list[str], int]:
+    """Merge stored and newly-extracted descriptions, dropping exact duplicates.
+
+    Stored fragments come first (preserving prior order), then new fragments not
+    already present. Deduplicating across stored *and* new (not only within the
+    new batch) prevents a re-extracted description from appending a duplicate
+    fragment on every reprocess or resume (issue #3367); it also collapses any
+    legacy duplicate fragments already stored. Returns the combined list and the
+    count of surviving stored fragments, used for accurate merge accounting.
+
+    Fragments are compared and stored *after* ``sanitize_text_for_encoding``:
+    stored descriptions were already sanitized before being persisted (the
+    single-description return and the join in ``_handle_entity_relation_summary``
+    both sanitize), while a freshly re-extracted description is still raw.
+    Comparing raw-vs-sanitized would miss the duplicate whenever sanitization
+    changed the string (e.g. an XML-illegal control char was stripped), so
+    "dirty" descriptions would keep accumulating across reprocess. Sanitizing
+    here is idempotent, so the later sanitize calls are unaffected. Fragments
+    that sanitize to empty are dropped (they carry no information and would only
+    inflate the fragment count / emit ``<sep><sep>`` artifacts on join).
+
+    The two-phase walk is deliberate: ``already_fragment`` is captured after the
+    stored pass so it stays an accurate count of surviving stored fragments. Do
+    NOT collapse both phases into a single ``dict.fromkeys`` over the
+    concatenation — that loses the stored/new boundary the merge accounting log
+    depends on.
+    """
+    combined: list[str] = []
+    seen: set[str] = set()
+
+    def _add_sanitized(descriptions: list[str]) -> None:
+        for desc in descriptions:
+            sanitized = sanitize_text_for_encoding(desc)
+            if sanitized and sanitized not in seen:
+                seen.add(sanitized)
+                combined.append(sanitized)
+
+    _add_sanitized(already_description)
+    already_fragment = len(combined)
+    _add_sanitized(new_descriptions)
+    return combined, already_fragment
 
 
 async def _merge_nodes_then_upsert(
@@ -1630,8 +2238,13 @@ async def _merge_nodes_then_upsert(
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
+    status_logger: PipelineStatusLogger | None = None,
 ):
     """Get existing nodes from knowledge graph use name,if exists, merge data, else create, then upsert."""
+    if status_logger is None:
+        # Fallback for direct callers that pass pipeline_status only; a
+        # throwaway logger reproduces the one-shot helper's behavior.
+        status_logger = PipelineStatusLogger(pipeline_status)
     timing_start = time.perf_counter()
     try:
         already_entity_types = []
@@ -1778,8 +2391,11 @@ async def _merge_nodes_then_upsert(
         )
         sorted_descriptions = [dp["description"] for dp in sorted_nodes]
 
-        # Combine already_description with sorted new sorted descriptions
-        description_list = already_description + sorted_descriptions
+        # Combine stored and new descriptions, deduplicating across both so a
+        # re-extracted description does not accumulate on reprocess (issue #3367)
+        description_list, already_fragment = _combine_descriptions_dedup(
+            already_description, sorted_descriptions
+        )
         if not description_list:
             fallback_description = f"Entity {entity_name}"
             logger.warning(
@@ -1864,7 +2480,6 @@ async def _merge_nodes_then_upsert(
 
         # 10.Log based on actual LLM usage
         num_fragment = len(description_list)
-        already_fragment = len(already_description)
         if llm_was_used:
             status_message = f"LLMmrg: `{entity_name}` | {already_fragment}+{num_fragment - already_fragment}"
         else:
@@ -1895,10 +2510,7 @@ async def _merge_nodes_then_upsert(
         # Add message to pipeline satus when merge happens
         if already_fragment > 0 or llm_was_used:
             logger.info(status_message)
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    pipeline_status["latest_message"] = status_message
-                    pipeline_status["history_messages"].append(status_message)
+            status_logger.log(status_message)
         else:
             logger.debug(status_message)
 
@@ -1919,7 +2531,11 @@ async def _merge_nodes_then_upsert(
         node_data["entity_name"] = entity_name
         if entity_vdb is not None:
             entity_vdb_id = compute_mdhash_id(str(entity_name), prefix="ent-")
-            entity_content = f"{entity_name}\n{description}"
+            entity_content = _truncate_vdb_content(
+                f"{entity_name}\n{description}",
+                global_config,
+                f"entity:{entity_name}",
+            )
             data_for_vdb = {
                 entity_vdb_id: {
                     "entity_name": entity_name,
@@ -1959,12 +2575,18 @@ async def _merge_edges_then_upsert(
     added_entities: list = None,  # New parameter to track entities added during edge processing
     relation_chunks_storage: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
+    status_logger: PipelineStatusLogger | None = None,
 ):
+    if status_logger is None:
+        # Fallback for direct callers that pass pipeline_status only; a
+        # throwaway logger reproduces the one-shot helper's behavior.
+        status_logger = PipelineStatusLogger(pipeline_status)
     timing_start = time.perf_counter()
     timing_relation = f"`{src_id}`~`{tgt_id}`"
     try:
         if src_id == tgt_id:
             return None
+        relation_key = f"{src_id}->{tgt_id}"
 
         already_edge = None
         already_weights = []
@@ -2092,8 +2714,40 @@ async def _merge_edges_then_upsert(
         # 6.1 Finalize source_id
         source_id = GRAPH_FIELD_SEP.join(source_ids)
 
-        # 6.2 Finalize weight by summing new edges and existing weights
-        weight = sum([dp["weight"] for dp in edges_data] + already_weights)
+        # 6.2 Finalize weight. Each extracted relation contributes weight 1.0
+        # (or its parsed strength), so a stored edge's weight tracks the number
+        # of distinct contributing sources. On reprocess/resume the same source
+        # can be re-fed while it is already reflected in already_weights (the
+        # stored scalar), so only sum weights of edges whose source_id is NOT
+        # already stored -- otherwise weight double-counts and grows 1 -> 2 -> 3
+        # per reprocess (the #3367 sibling of description accumulation).
+        # Genuinely new sources still add their weight, preserving legitimate
+        # multi-document growth.
+        #
+        # Filter on the EDGE's own source_ids (already_source_ids) -- the same
+        # source as already_weights -- NOT existing_full_source_ids, which can
+        # come from relation_chunks_storage, a SEPARATE store. relation_chunks
+        # can run ahead of the graph edge on a partial write (chunks upserted,
+        # upsert_edge not yet), so filtering on it would wrongly skip a genuinely
+        # new source (under-count), or, with no stored weight at all, recover the
+        # edge with weight 0. Filtering on already_source_ids keeps the exclusion
+        # consistent with the stored scalar: when there is no stored edge
+        # (already_source_ids empty) nothing is excluded, so a recovered edge
+        # keeps its full weight; a re-fed already-stored source is dropped.
+        # A falsy source_id is dropped from new_source_ids above (it never
+        # persists), so it must not add weight either -- otherwise weight would
+        # outgrow the stored source count. Count only sources that actually
+        # persist: truthy AND not already reflected in the stored scalar.
+        already_edge_source_set = set(already_source_ids)
+        weight = sum(
+            [
+                dp["weight"]
+                for dp in edges_data
+                if dp.get("source_id")
+                and dp["source_id"] not in already_edge_source_set
+            ]
+            + already_weights
+        )
 
         # 6.2 Finalize keywords by merging existing and new keywords
         all_keywords = set()
@@ -2131,8 +2785,11 @@ async def _merge_edges_then_upsert(
         )
         sorted_descriptions = [dp["description"] for dp in sorted_edges]
 
-        # Combine already_description with sorted new descriptions
-        description_list = already_description + sorted_descriptions
+        # Combine stored and new descriptions, deduplicating across both so a
+        # re-extracted description does not accumulate on reprocess (issue #3367)
+        description_list, already_fragment = _combine_descriptions_dedup(
+            already_description, sorted_descriptions
+        )
         if not description_list:
             logger.error(f"Relation {src_id}~{tgt_id} has no description")
             raise ValueError(f"Relation {src_id}~{tgt_id} has no description")
@@ -2182,7 +2839,6 @@ async def _merge_edges_then_upsert(
                 file_paths_list.append(file_path_item)
                 seen_paths.add(file_path_item)
             await _cooperative_yield(i, every=32)
-
         # Apply count limit
         if len(file_paths_list) > max_file_paths:
             limit_method = global_config.get(
@@ -2213,7 +2869,6 @@ async def _merge_edges_then_upsert(
 
         # 10. Log based on actual LLM usage
         num_fragment = len(description_list)
-        already_fragment = len(already_description)
         if llm_was_used:
             status_message = f"LLMmrg: `{src_id}`~`{tgt_id}` | {already_fragment}+{num_fragment - already_fragment}"
         else:
@@ -2244,10 +2899,7 @@ async def _merge_edges_then_upsert(
         # Add message to pipeline satus when merge happens
         if already_fragment > 0 or llm_was_used:
             logger.info(status_message)
-            if pipeline_status is not None and pipeline_status_lock is not None:
-                async with pipeline_status_lock:
-                    pipeline_status["latest_message"] = status_message
-                    pipeline_status["history_messages"].append(status_message)
+            status_logger.log(status_message)
         else:
             logger.debug(status_message)
 
@@ -2287,7 +2939,11 @@ async def _merge_edges_then_upsert(
 
                 if entity_vdb is not None:
                     entity_vdb_id = compute_mdhash_id(need_insert_id, prefix="ent-")
-                    entity_content = f"{need_insert_id}\n{description}"
+                    entity_content = _truncate_vdb_content(
+                        f"{need_insert_id}\n{description}",
+                        global_config,
+                        f"entity:{need_insert_id}",
+                    )
                     vdb_data = {
                         entity_vdb_id: {
                             "content": entity_content,
@@ -2300,9 +2956,14 @@ async def _merge_edges_then_upsert(
                     await safe_vdb_operation_with_exception(
                         operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
                         operation_name="added_entity_upsert",
-                        entity_name=need_insert_id,
+                        entity_name=f"{need_insert_id} [relation:{relation_key}]",
                         max_retries=3,
                         retry_delay=0.1,
+                        timeout_seconds=_get_relationship_vdb_timeout_seconds(
+                            global_config
+                        ),
+                        log_start=False,
+                        success_log_threshold_seconds=5.0,
                     )
 
                 # Track entities added during edge processing
@@ -2407,14 +3068,24 @@ async def _merge_edges_then_upsert(
                                 ),
                             }
                         }
+                        # Inside the `entity_vdb is not None` guard: vdb_data is
+                        # only assigned here, and entity_vdb.upsert needs a real
+                        # store. Previously this call sat outside the guard, so
+                        # entity_vdb=None raised UnboundLocalError on vdb_data
+                        # (and would have called None.upsert).
                         await safe_vdb_operation_with_exception(
                             operation=lambda payload=vdb_data: entity_vdb.upsert(
                                 payload
                             ),
                             operation_name="existing_entity_update",
-                            entity_name=need_insert_id,
+                            entity_name=f"{need_insert_id} [relation:{relation_key}]",
                             max_retries=3,
                             retry_delay=0.1,
+                            timeout_seconds=_get_relationship_vdb_timeout_seconds(
+                                global_config
+                            ),
+                            log_start=False,
+                            success_log_threshold_seconds=5.0,
                         )
 
                 # 6. Log once at the end if any update occurred
@@ -2423,12 +3094,10 @@ async def _merge_edges_then_upsert(
                         f"Chunks appended from relation: `{need_insert_id}`"
                     )
                     logger.info(status_message)
-                    if pipeline_status is not None and pipeline_status_lock is not None:
-                        async with pipeline_status_lock:
-                            pipeline_status["latest_message"] = status_message
-                            pipeline_status["history_messages"].append(status_message)
+                    status_logger.log(status_message)
 
         edge_created_at = int(time.time())
+        edge_upsert_started = time.perf_counter()
         await knowledge_graph_inst.upsert_edge(
             src_id,
             tgt_id,
@@ -2442,6 +3111,13 @@ async def _merge_edges_then_upsert(
                 truncate=truncation_info,
             ),
         )
+        edge_upsert_elapsed = time.perf_counter() - edge_upsert_started
+        if edge_upsert_elapsed >= 5.0:
+            logger.info(
+                "Graph edge upsert slow for `%s` in %.2fs",
+                relation_key,
+                edge_upsert_elapsed,
+            )
 
         edge_data = dict(
             src_id=src_id,
@@ -2468,7 +3144,11 @@ async def _merge_edges_then_upsert(
                 logger.debug(
                     f"Could not delete old relationship vector records {rel_vdb_id}, {rel_vdb_id_reverse}: {e}"
                 )
-            rel_content = f"{keywords}\t{src_id}\n{tgt_id}\n{description}"
+            rel_content = _truncate_vdb_content(
+                f"{keywords}\t{src_id}\n{tgt_id}\n{description}",
+                global_config,
+                f"relationship:{src_id}-{tgt_id}",
+            )
             vdb_data = {
                 rel_vdb_id: {
                     "src_id": src_id,
@@ -2481,12 +3161,20 @@ async def _merge_edges_then_upsert(
                     "file_path": file_path,
                 }
             }
+            relation_status_message = f"Upserting relation VDB: `{relation_key}`"
+            logger.info(relation_status_message)
+            if pipeline_status is not None and pipeline_status_lock is not None:
+                async with pipeline_status_lock:
+                    pipeline_status["latest_message"] = relation_status_message
             await safe_vdb_operation_with_exception(
                 operation=lambda payload=vdb_data: relationships_vdb.upsert(payload),
                 operation_name="relationship_upsert",
-                entity_name=f"{src_id}-{tgt_id}",
+                entity_name=relation_key,
                 max_retries=3,
                 retry_delay=0.2,
+                timeout_seconds=_get_relationship_vdb_timeout_seconds(global_config),
+                log_start=False,
+                success_log_threshold_seconds=5.0,
             )
 
         return edge_data
@@ -2496,6 +3184,43 @@ async def _merge_edges_then_upsert(
             timing_relation,
             time.perf_counter() - timing_start,
         )
+
+
+def collect_kg_merge_candidates(
+    chunk_results: list,
+) -> tuple[set[str], set[tuple[str, str]]]:
+    """Derive the full candidate entity/relation superset a merge may touch.
+
+    Recovery anchor for issue #3400: before any graph/vector/tracking
+    mutation, the caller must be able to persist a durable candidate set in
+    ``full_entities`` / ``full_relations`` so a later purge/retry can discover
+    every object the merge might have written. The superset therefore
+    includes:
+
+    - every extracted entity name;
+    - every endpoint of every extracted relation (relation processing can
+      create missing endpoint entities, see ``_merge_edges_then_upsert``);
+    - every relation pair, normalized to sorted order (undirected graph).
+
+    The result is a candidate SUPERSET, not proof of existence: purge must
+    verify source ownership per candidate and treat absent objects as no-ops.
+
+    Args:
+        chunk_results: List of ``(maybe_nodes, maybe_edges)`` tuples as
+            produced by ``extract_entities``.
+
+    Returns:
+        ``(candidate_entity_names, candidate_relation_pairs)``.
+    """
+    candidate_entities: set[str] = set()
+    candidate_relations: set[tuple[str, str]] = set()
+    for maybe_nodes, maybe_edges in chunk_results:
+        candidate_entities.update(maybe_nodes.keys())
+        for edge_key in maybe_edges:
+            pair = tuple(sorted((edge_key[0], edge_key[1])))
+            candidate_relations.add(pair)
+            candidate_entities.update(pair)
+    return candidate_entities, candidate_relations
 
 
 async def merge_nodes_and_edges(
@@ -2516,12 +3241,16 @@ async def merge_nodes_and_edges(
     total_files: int = 0,
     file_path: str = "unknown_source",
 ) -> None:
-    """Two-phase merge: process all entities first, then all relationships
+    """Merge extracted entities/relations into the KG behind write-ahead anchors.
 
-    This approach ensures data consistency by:
+    Phase order (issue #3400 — discoverability before mutation):
+    0. Phase 0: Persist the full candidate superset to ``full_entities`` /
+       ``full_relations`` and flush both BEFORE any graph mutation, so a
+       crash mid-merge always leaves a durable recovery anchor that purge /
+       retry can discover the contributions from. Both rows are written even
+       when empty; a failure here aborts the merge before mutation.
     1. Phase 1: Process all entities concurrently
     2. Phase 2: Process all relationships concurrently (may add missing entities)
-    3. Phase 3: Update full_entities and full_relations storage with final results
 
     Args:
         chunk_results: List of tuples (maybe_nodes, maybe_edges) containing extracted entities and relationships
@@ -2548,6 +3277,11 @@ async def merge_nodes_and_edges(
             if pipeline_status.get("cancellation_requested", False):
                 raise PipelineCancelledException("User cancelled during merge phase")
 
+    # Operation-scoped status logger shared by all entity/relation merge tasks
+    # of this document: the first history write fetches the shared list once;
+    # every merge log is then a single extend on the cached handle.
+    status_logger = PipelineStatusLogger(pipeline_status)
+
     # Collect all nodes and edges from all chunks
     all_nodes = defaultdict(list)
     all_edges = defaultdict(list)
@@ -2570,7 +3304,57 @@ async def merge_nodes_and_edges(
     logger.info(log_message)
     async with pipeline_status_lock:
         pipeline_status["latest_message"] = log_message
-        pipeline_status["history_messages"].append(log_message)
+        append_pipeline_history(pipeline_status, log_message)
+
+    # ===== Phase 0: write-ahead recovery indexes (issue #3400) =====
+    # Persist the candidate superset BEFORE any graph/vector/tracking
+    # mutation. Candidates are a superset, not proof of existence: purge
+    # verifies ownership per candidate and skips absent objects. Empty rows
+    # are written too — a reprocess that now yields fewer (or zero)
+    # candidates must overwrite the stale anchors of the previous attempt.
+    if full_entities_storage and full_relations_storage and doc_id:
+        candidate_entities, candidate_relations = collect_kg_merge_candidates(
+            chunk_results
+        )
+        log_message = (
+            f"Phase 0: Writing recovery indexes for {doc_id}: "
+            f"{len(candidate_entities)} candidate entities, "
+            f"{len(candidate_relations)} candidate relations"
+        )
+        logger.info(log_message)
+        async with pipeline_status_lock:
+            pipeline_status["latest_message"] = log_message
+            append_pipeline_history(pipeline_status, log_message)
+
+        await full_entities_storage.upsert(
+            {
+                doc_id: {
+                    "entity_names": sorted(candidate_entities),
+                    "count": len(candidate_entities),
+                }
+            }
+        )
+        await full_relations_storage.upsert(
+            {
+                doc_id: {
+                    "relation_pairs": [
+                        list(pair) for pair in sorted(candidate_relations)
+                    ],
+                    "count": len(candidate_relations),
+                }
+            }
+        )
+        # Narrow flush barrier: both anchors must be durable before the first
+        # graph mutation. A failure propagates — merging without a recovery
+        # anchor would make a later partial failure undiscoverable.
+        for storage_inst in (full_entities_storage, full_relations_storage):
+            try:
+                await storage_inst.index_done_callback()
+            except Exception as e:
+                namespace = getattr(storage_inst, "final_namespace", None) or getattr(
+                    storage_inst, "namespace", ""
+                )
+                raise IndexFlushError(type(storage_inst).__name__, namespace, e) from e
 
     # Get max async tasks limit from global_config for semaphore control
     graph_max_async = global_config.get("llm_model_max_async", 4) * 2
@@ -2581,7 +3365,7 @@ async def merge_nodes_and_edges(
     logger.info(log_message)
     async with pipeline_status_lock:
         pipeline_status["latest_message"] = log_message
-        pipeline_status["history_messages"].append(log_message)
+        append_pipeline_history(pipeline_status, log_message)
 
     async def _locked_process_entity_name(entity_name, entities):
         async with semaphore:
@@ -2610,6 +3394,7 @@ async def merge_nodes_and_edges(
                         pipeline_status_lock,
                         llm_response_cache,
                         entity_chunks_storage,
+                        status_logger=status_logger,
                     )
 
                     return entity_data
@@ -2626,7 +3411,7 @@ async def merge_nodes_and_edges(
                         ):
                             async with pipeline_status_lock:
                                 pipeline_status["latest_message"] = error_msg
-                                pipeline_status["history_messages"].append(error_msg)
+                                append_pipeline_history(pipeline_status, error_msg)
                     except Exception as status_error:
                         logger.error(
                             f"Failed to update pipeline status: {status_error}"
@@ -2645,40 +3430,14 @@ async def merge_nodes_and_edges(
         entity_tasks.append(task)
         await _cooperative_yield(i, every=16)
 
-    # Execute entity tasks with error handling
+    # Execute entity tasks; on any failure every sibling is cancelled and
+    # drained before the first exception propagates (no background writes
+    # survive failure handling — issue #3400).
     processed_entities = []
     if entity_tasks:
-        done, pending = await asyncio.wait(
-            entity_tasks, return_when=asyncio.FIRST_EXCEPTION
+        processed_entities = await wait_tasks_with_drain(
+            entity_tasks, context=f"entity merge {doc_id}"
         )
-
-        first_exception = None
-        processed_entities = []
-
-        for i, task in enumerate(done, start=1):
-            try:
-                result = task.result()
-            except BaseException as e:
-                if first_exception is None:
-                    first_exception = e
-            else:
-                processed_entities.append(result)
-            await _cooperative_yield(i, every=32)
-
-        if pending:
-            for task in pending:
-                task.cancel()
-            pending_results = await asyncio.gather(*pending, return_exceptions=True)
-            for result in pending_results:
-                if isinstance(result, BaseException):
-                    if first_exception is None:
-                        first_exception = result
-                else:
-                    processed_entities.append(result)
-
-        if first_exception is not None:
-            raise first_exception
-
         await asyncio.sleep(0)
 
     # ===== Phase 2: Process all relationships concurrently =====
@@ -2686,7 +3445,7 @@ async def merge_nodes_and_edges(
     logger.info(log_message)
     async with pipeline_status_lock:
         pipeline_status["latest_message"] = log_message
-        pipeline_status["history_messages"].append(log_message)
+        append_pipeline_history(pipeline_status, log_message)
 
     async def _locked_process_edges(edge_key, edges):
         async with semaphore:
@@ -2701,6 +3460,7 @@ async def merge_nodes_and_edges(
             workspace = global_config.get("workspace", "")
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
             sorted_edge_key = sorted([edge_key[0], edge_key[1]])
+            edge_label = _format_relation_edge_label(edge_key)
 
             async with get_storage_keyed_lock(
                 sorted_edge_key,
@@ -2710,7 +3470,6 @@ async def merge_nodes_and_edges(
                 try:
                     added_entities = []  # Track entities added during edge processing
 
-                    logger.debug(f"Processing relation {sorted_edge_key}")
                     edge_data = await _merge_edges_then_upsert(
                         edge_key[0],
                         edge_key[1],
@@ -2725,6 +3484,7 @@ async def merge_nodes_and_edges(
                         added_entities,  # Pass list to collect added entities
                         relation_chunks_storage,
                         entity_chunks_storage,  # Add entity_chunks_storage parameter
+                        status_logger=status_logger,
                     )
 
                     if edge_data is None:
@@ -2733,7 +3493,7 @@ async def merge_nodes_and_edges(
                     return edge_data, added_entities
 
                 except Exception as e:
-                    error_msg = f"Error processing relation `{sorted_edge_key}`: {e}"
+                    error_msg = f"Error processing relation `{edge_label}`: {e}"
                     logger.error(error_msg)
 
                     # Try to update pipeline status, but don't let status update failure affect main exception
@@ -2744,140 +3504,60 @@ async def merge_nodes_and_edges(
                         ):
                             async with pipeline_status_lock:
                                 pipeline_status["latest_message"] = error_msg
-                                pipeline_status["history_messages"].append(error_msg)
+                                append_pipeline_history(pipeline_status, error_msg)
                     except Exception as status_error:
                         logger.error(
                             f"Failed to update pipeline status: {status_error}"
                         )
 
                     # Re-raise the original exception with a prefix
-                    prefixed_exception = create_prefixed_exception(
-                        e, f"{sorted_edge_key}"
-                    )
+                    prefixed_exception = create_prefixed_exception(e, f"{edge_label}")
                     raise prefixed_exception from e
 
     # Create relationship processing tasks
     edge_tasks = []
+    edge_task_labels: dict[asyncio.Task, str] = {}
     for i, (edge_key, edges) in enumerate(all_edges.items(), start=1):
         task = asyncio.create_task(_locked_process_edges(edge_key, edges))
         edge_tasks.append(task)
-        await _cooperative_yield(i, every=16)
+        edge_task_labels[task] = _format_relation_edge_label(edge_key)
+        await _cooperative_yield(i, every=32)
 
-    # Execute relationship tasks with error handling
+    # Execute relationship tasks; failures cancel + drain every sibling
+    # before propagating (see wait_tasks_with_drain).
     processed_edges = []
     all_added_entities = []
 
     if edge_tasks:
-        done, pending = await asyncio.wait(
-            edge_tasks, return_when=asyncio.FIRST_EXCEPTION
+        edge_results = await wait_tasks_with_drain(
+            edge_tasks,
+            context=f"relation merge {doc_id}",
+            task_labels=edge_task_labels,
         )
+        for edge_data, added_entities in edge_results:
+            if edge_data is not None:
+                processed_edges.append(edge_data)
+            all_added_entities.extend(added_entities)
 
-        first_exception = None
-
-        for i, task in enumerate(done, start=1):
-            try:
-                edge_data, added_entities = task.result()
-            except BaseException as e:
-                if first_exception is None:
-                    first_exception = e
-            else:
-                if edge_data is not None:
-                    processed_edges.append(edge_data)
-                all_added_entities.extend(added_entities)
-            await _cooperative_yield(i, every=32)
-
-        if pending:
-            for task in pending:
-                task.cancel()
-            pending_results = await asyncio.gather(*pending, return_exceptions=True)
-            for result in pending_results:
-                if isinstance(result, BaseException):
-                    if first_exception is None:
-                        first_exception = result
-                else:
-                    edge_data, added_entities = result
-                    if edge_data is not None:
-                        processed_edges.append(edge_data)
-                    all_added_entities.extend(added_entities)
-
-        if first_exception is not None:
-            raise first_exception
-
+        logger.info(
+            "Phase 2 relation processing completed for %s: edges=%d added_entities=%d",
+            doc_id,
+            len(processed_edges),
+            len(all_added_entities),
+        )
         await asyncio.sleep(0)
 
-    # ===== Phase 3: Update full_entities and full_relations storage =====
-    if full_entities_storage and full_relations_storage and doc_id:
-        try:
-            # Merge all entities: original entities + entities added during edge processing
-            final_entity_names = set()
-
-            # Add original processed entities
-            for i, entity_data in enumerate(processed_entities, start=1):
-                if entity_data and entity_data.get("entity_name"):
-                    final_entity_names.add(entity_data["entity_name"])
-                await _cooperative_yield(i, every=32)
-
-            # Add entities that were added during relationship processing
-            for i, added_entity in enumerate(all_added_entities, start=1):
-                if added_entity and added_entity.get("entity_name"):
-                    final_entity_names.add(added_entity["entity_name"])
-                await _cooperative_yield(i, every=32)
-
-            # Collect all relation pairs
-            final_relation_pairs = set()
-            for i, edge_data in enumerate(processed_edges, start=1):
-                if edge_data:
-                    src_id = edge_data.get("src_id")
-                    tgt_id = edge_data.get("tgt_id")
-                    if src_id and tgt_id:
-                        relation_pair = tuple(sorted([src_id, tgt_id]))
-                        final_relation_pairs.add(relation_pair)
-                await _cooperative_yield(i, every=32)
-
-            log_message = f"Phase 3: Updating final {len(final_entity_names)}({len(processed_entities)}+{len(all_added_entities)}) entities and  {len(final_relation_pairs)} relations from {doc_id}"
-            logger.info(log_message)
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = log_message
-                pipeline_status["history_messages"].append(log_message)
-
-            # Update storage
-            if final_entity_names:
-                await full_entities_storage.upsert(
-                    {
-                        doc_id: {
-                            "entity_names": list(final_entity_names),
-                            "count": len(final_entity_names),
-                        }
-                    }
-                )
-
-            if final_relation_pairs:
-                await full_relations_storage.upsert(
-                    {
-                        doc_id: {
-                            "relation_pairs": [
-                                list(pair) for pair in final_relation_pairs
-                            ],
-                            "count": len(final_relation_pairs),
-                        }
-                    }
-                )
-
-            logger.debug(
-                f"Updated entity-relation index for document {doc_id}: {len(final_entity_names)} entities (original: {len(processed_entities)}, added: {len(all_added_entities)}), {len(final_relation_pairs)} relations"
-            )
-
-        except Exception as e:
-            logger.error(
-                f"Failed to update entity-relation index for document {doc_id}: {e}"
-            )
-            # Don't raise exception to avoid affecting main flow
+    # NOTE: the recovery indexes are written (and flushed) in Phase 0, BEFORE
+    # graph mutation. The historical post-merge "Phase 3" write — which
+    # derived the rows from in-memory merge results and swallowed its own
+    # exceptions — is gone: a merge whose anchors cannot be persisted no
+    # longer mutates the graph at all (issue #3400).
 
     log_message = f"Completed merging: {len(processed_entities)} entities, {len(all_added_entities)} extra entities, {len(processed_edges)} relations"
     logger.info(log_message)
     async with pipeline_status_lock:
         pipeline_status["latest_message"] = log_message
-        pipeline_status["history_messages"].append(log_message)
+        append_pipeline_history(pipeline_status, log_message)
 
 
 async def extract_entities(
@@ -2896,34 +3576,79 @@ async def extract_entities(
                     "User cancelled during entity extraction"
                 )
 
-    use_llm_func: callable = global_config["llm_model_func"]
+    # Operation-scoped status logger shared by all chunk tasks: the first
+    # history write fetches the shared list once; every per-chunk log is then
+    # a single extend on the cached handle.
+    status_logger = PipelineStatusLogger(pipeline_status)
+
+    use_llm_func: callable = global_config["role_llm_funcs"]["extract"]
     entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
+    # Cap on the gleaning LLM call's combined input (system + history user
+    # prompt + history assistant response + continue prompt).  Pulled from
+    # the same env knob that gates ``analyze_multimodal``'s sidecar trimming
+    # so both EXTRACT-role consumers share one source of truth.  ``0``
+    # disables the gleaning guard (gleaning always runs regardless of size).
+    max_extract_input_tokens = get_env_value(
+        "MAX_EXTRACT_INPUT_TOKENS",
+        DEFAULT_MAX_EXTRACT_INPUT_TOKENS,
+        int,
+    )
+    extract_tokenizer: Tokenizer | None = global_config.get("tokenizer")
+
+    # Check if JSON structured output mode is enabled
+    use_json_extraction = global_config.get("entity_extraction_use_json", False)
 
     ordered_chunks = list(chunks.items())
     # add language and example number params to prompt
-    language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
-    entity_types = global_config["addon_params"].get(
-        "entity_types", DEFAULT_ENTITY_TYPES
-    )
+    addon_params = global_config.get("addon_params") or {}
+    language = global_config.get("_resolved_summary_language")
+    if language is None:
+        language = addon_params.get("language", DEFAULT_SUMMARY_LANGUAGE)
+    prompt_profile = global_config.get("_entity_extraction_prompt_profile")
+    if prompt_profile is None:
+        # Fallback for callers that construct global_config directly (e.g. tests
+        # or custom wiring). Re-run the resolver so behavior matches the cached
+        # path that LightRAG.__post_init__ populates, instead of duplicating
+        # guidance/override logic here.
+        prompt_profile = resolve_entity_extraction_prompt_profile(
+            addon_params, use_json_extraction
+        )
+    entity_types_guidance = prompt_profile["entity_types_guidance"]
 
-    examples = "\n".join(PROMPTS["entity_extraction_examples"])
+    max_total_records = global_config["entity_extract_max_records"]
+    max_entity_records = global_config["entity_extract_max_entities"]
 
-    example_context_base = dict(
-        tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
-        completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
-        entity_types=", ".join(entity_types),
-        language=language,
-    )
-    # add example's format
-    examples = examples.format(**example_context_base)
+    if use_json_extraction:
+        # JSON mode: use JSON-specific prompts without delimiters
+        examples = "\n".join(prompt_profile["entity_extraction_json_examples"])
+        context_base = dict(
+            entity_types_guidance=entity_types_guidance,
+            examples=examples,
+            language=language,
+            max_total_records=max_total_records,
+            max_entity_records=max_entity_records,
+        )
+    else:
+        # Text mode: use traditional delimiter-based prompts
+        examples = "\n".join(prompt_profile["entity_extraction_examples"])
+        example_context_base = dict(
+            tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
+            completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
+            entity_types_guidance=entity_types_guidance,
+            language=language,
+        )
+        # add example's format
+        examples = examples.format(**example_context_base)
 
-    context_base = dict(
-        tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
-        completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
-        entity_types=",".join(entity_types),
-        examples=examples,
-        language=language,
-    )
+        context_base = dict(
+            tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
+            completion_delimiter=PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
+            entity_types_guidance=entity_types_guidance,
+            examples=examples,
+            language=language,
+            max_total_records=max_total_records,
+            max_entity_records=max_entity_records,
+        )
 
     processed_chunks = 0
     total_chunks = len(ordered_chunks)
@@ -2939,25 +3664,71 @@ async def extract_entities(
         nonlocal processed_chunks
         chunk_key = chunk_key_dp[0]
         chunk_dp = chunk_key_dp[1]
-        content = chunk_dp["content"]
+        # Strip parser-internal markup (<cite refid>, <drawing id/path/src>,
+        # <equation id>) before building the extraction prompt. The stored
+        # chunk content is left intact so query-time citations still resolve.
+        content = strip_internal_multimodal_markup_for_extraction(chunk_dp["content"])
         # Get file path from chunk data or use default
         file_path = chunk_dp.get("file_path", "unknown_source")
+
+        # Build the optional `---Section Context---` block from the chunk's
+        # heading breadcrumb. The marker/wrapping lives entirely in the prompt
+        # template; here we only produce the data and decide whether to inject
+        # it. Each level is char-capped inside format_heading_context, and the
+        # joined path is token-budgeted here so heading metadata can never push
+        # an otherwise-valid chunk past the provider context window. When the
+        # chunk carries no heading, the block is an empty string so the user
+        # prompt stays byte-identical to the no-context form.
+        heading_path = _truncate_section_context(
+            format_heading_context(chunk_dp),
+            extract_tokenizer,
+            DEFAULT_MAX_SECTION_CONTEXT_TOKENS,
+        )
+        heading_context_block = (
+            PROMPTS["entity_extraction_section_context"].format(
+                heading_path=heading_path
+            )
+            if heading_path
+            else ""
+        )
 
         # Create cache keys collector for batch processing
         cache_keys_collector = []
 
-        # Get initial extraction
-        # Format system prompt without input_text for each chunk (enables OpenAI prompt caching across chunks)
-        entity_extraction_system_prompt = PROMPTS[
-            "entity_extraction_system_prompt"
-        ].format(**context_base)
-        # Format user prompts with input_text for each chunk
-        entity_extraction_user_prompt = PROMPTS["entity_extraction_user_prompt"].format(
-            **{**context_base, "input_text": content}
-        )
-        entity_continue_extraction_user_prompt = PROMPTS[
-            "entity_continue_extraction_user_prompt"
-        ].format(**{**context_base, "input_text": content})
+        if use_json_extraction:
+            # JSON mode: use JSON prompts and pass entity_extraction flag to LLM provider
+            entity_extraction_system_prompt = PROMPTS[
+                "entity_extraction_json_system_prompt"
+            ].format(**context_base)
+            entity_extraction_user_prompt = PROMPTS[
+                "entity_extraction_json_user_prompt"
+            ].format(
+                **{
+                    **context_base,
+                    "input_text": content,
+                    "heading_context_block": heading_context_block,
+                }
+            )
+            entity_continue_extraction_user_prompt = PROMPTS[
+                "entity_continue_extraction_json_user_prompt"
+            ].format(**context_base)
+        else:
+            # Text mode: use traditional delimiter-based prompts
+            entity_extraction_system_prompt = PROMPTS[
+                "entity_extraction_system_prompt"
+            ].format(**context_base)
+            entity_extraction_user_prompt = PROMPTS[
+                "entity_extraction_user_prompt"
+            ].format(
+                **{
+                    **context_base,
+                    "input_text": content,
+                    "heading_context_block": heading_context_block,
+                }
+            )
+            entity_continue_extraction_user_prompt = PROMPTS[
+                "entity_continue_extraction_user_prompt"
+            ].format(**{**context_base, "input_text": content})
 
         final_result, timestamp = await use_llm_func_with_cache(
             entity_extraction_user_prompt,
@@ -2967,56 +3738,87 @@ async def extract_entities(
             cache_type="extract",
             chunk_id=chunk_key,
             cache_keys_collector=cache_keys_collector,
+            response_format=({"type": "json_object"} if use_json_extraction else None),
+            llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
         )
 
         history = pack_user_ass_to_openai_messages(
             entity_extraction_user_prompt, final_result
         )
 
-        # Process initial extraction with file path
-        maybe_nodes, maybe_edges = await _process_extraction_result(
-            final_result,
-            chunk_key,
-            timestamp,
-            file_path,
-            tuple_delimiter=context_base["tuple_delimiter"],
-            completion_delimiter=context_base["completion_delimiter"],
-        )
+        # Process initial extraction with appropriate parser
+        if use_json_extraction:
+            maybe_nodes, maybe_edges = await _process_json_extraction_result(
+                final_result,
+                chunk_key,
+                timestamp,
+                file_path,
+            )
+        else:
+            maybe_nodes, maybe_edges = await _process_extraction_result(
+                final_result,
+                chunk_key,
+                timestamp,
+                file_path,
+                tuple_delimiter=context_base["tuple_delimiter"],
+                completion_delimiter=context_base["completion_delimiter"],
+            )
 
         # Process additional gleaning results only 1 time when entity_extract_max_gleaning is greater than zero.
-        if entity_extract_max_gleaning > 0:
-            # Calculate total tokens for the gleaning request to prevent context window overflow
-            tokenizer = global_config["tokenizer"]
-            max_input_tokens = global_config["max_extract_input_tokens"]
-
-            # Approximate total tokens: system prompt + history + user prompt.
-            # This slightly underestimates actual API usage (missing role/framing tokens)
-            # but is sufficient as a safety guard against context window overflow.
-            history_str = json.dumps(history, ensure_ascii=False)
-            full_context_str = (
-                entity_extraction_system_prompt
-                + history_str
-                + entity_continue_extraction_user_prompt
+        run_gleaning = entity_extract_max_gleaning > 0
+        if (
+            run_gleaning
+            and extract_tokenizer is not None
+            and max_extract_input_tokens > 0
+        ):
+            # Gleaning replays the initial extraction's user/assistant pair
+            # via ``history_messages`` and appends a "continue" instruction.
+            # When the initial response was large (many entities/edges) or
+            # the chunk content is itself near the budget, that combined
+            # payload can blow past MAX_EXTRACT_INPUT_TOKENS and yield a
+            # provider ``context_length_exceeded`` error.  Pre-check here
+            # and skip rather than fail.
+            gleaning_token_count = (
+                len(extract_tokenizer.encode(entity_extraction_system_prompt))
+                + sum(
+                    len(extract_tokenizer.encode(msg.get("content", "") or ""))
+                    for msg in history
+                )
+                + len(extract_tokenizer.encode(entity_continue_extraction_user_prompt))
             )
-            token_count = len(tokenizer.encode(full_context_str))
-
-            if token_count > max_input_tokens:
+            if gleaning_token_count > max_extract_input_tokens:
                 logger.warning(
-                    f"Gleaning stopped for chunk {chunk_key}: Input tokens ({token_count}) exceeded limit ({max_input_tokens})."
+                    f"Gleaning stopped for chunk {chunk_key}: "
+                    f"Input tokens ({gleaning_token_count}) exceeded limit "
+                    f"({max_extract_input_tokens})."
+                )
+                run_gleaning = False
+
+        if run_gleaning:
+            glean_result, timestamp = await use_llm_func_with_cache(
+                entity_continue_extraction_user_prompt,
+                use_llm_func,
+                system_prompt=entity_extraction_system_prompt,
+                llm_response_cache=llm_response_cache,
+                history_messages=history,
+                cache_type="extract",
+                chunk_id=chunk_key,
+                cache_keys_collector=cache_keys_collector,
+                response_format=(
+                    {"type": "json_object"} if use_json_extraction else None
+                ),
+                llm_cache_identity=get_llm_cache_identity(global_config, "extract"),
+            )
+
+            # Process gleaning result with appropriate parser
+            if use_json_extraction:
+                glean_nodes, glean_edges = await _process_json_extraction_result(
+                    glean_result,
+                    chunk_key,
+                    timestamp,
+                    file_path,
                 )
             else:
-                glean_result, timestamp = await use_llm_func_with_cache(
-                    entity_continue_extraction_user_prompt,
-                    use_llm_func,
-                    system_prompt=entity_extraction_system_prompt,
-                    llm_response_cache=llm_response_cache,
-                    history_messages=history,
-                    cache_type="extract",
-                    chunk_id=chunk_key,
-                    cache_keys_collector=cache_keys_collector,
-                )
-
-                # Process gleaning result separately with file path
                 glean_nodes, glean_edges = await _process_extraction_result(
                     glean_result,
                     chunk_key,
@@ -3026,46 +3828,114 @@ async def extract_entities(
                     completion_delimiter=context_base["completion_delimiter"],
                 )
 
-                # Merge results - compare description lengths to choose better version
-                for i, (entity_name, glean_entities) in enumerate(
-                    glean_nodes.items(), start=1
-                ):
-                    if entity_name in maybe_nodes:
-                        # Compare description lengths and keep the better one
-                        original_desc_len = len(
-                            maybe_nodes[entity_name][0].get("description", "") or ""
-                        )
-                        glean_desc_len = len(
-                            glean_entities[0].get("description", "") or ""
-                        )
+            # Merge results - compare description lengths to choose better version
+            for i, (entity_name, glean_entities) in enumerate(
+                glean_nodes.items(), start=1
+            ):
+                if entity_name in maybe_nodes:
+                    # Compare description lengths and keep the better one
+                    original_desc_len = len(
+                        maybe_nodes[entity_name][0].get("description", "") or ""
+                    )
+                    glean_desc_len = len(glean_entities[0].get("description", "") or "")
 
-                        if glean_desc_len > original_desc_len:
-                            maybe_nodes[entity_name] = list(glean_entities)
-                        # Otherwise keep original version
-                    else:
-                        # New entity from gleaning stage
+                    if glean_desc_len > original_desc_len:
                         maybe_nodes[entity_name] = list(glean_entities)
-                    await _cooperative_yield(i, every=8)
+                    # Otherwise keep original version
+                else:
+                    # New entity from gleaning stage
+                    maybe_nodes[entity_name] = list(glean_entities)
+                await _cooperative_yield(i, every=8)
 
-                for i, (edge_key, glean_edge_list) in enumerate(
-                    glean_edges.items(), start=1
-                ):
-                    if edge_key in maybe_edges:
-                        # Compare description lengths and keep the better one
-                        original_desc_len = len(
-                            maybe_edges[edge_key][0].get("description", "") or ""
-                        )
-                        glean_desc_len = len(
-                            glean_edge_list[0].get("description", "") or ""
-                        )
+            for i, (edge_key, glean_edge_list) in enumerate(
+                glean_edges.items(), start=1
+            ):
+                if edge_key in maybe_edges:
+                    # Compare description lengths and keep the better one
+                    original_desc_len = len(
+                        maybe_edges[edge_key][0].get("description", "") or ""
+                    )
+                    glean_desc_len = len(
+                        glean_edge_list[0].get("description", "") or ""
+                    )
 
-                        if glean_desc_len > original_desc_len:
-                            maybe_edges[edge_key] = list(glean_edge_list)
-                        # Otherwise keep original version
-                    else:
-                        # New edge from gleaning stage
+                    if glean_desc_len > original_desc_len:
                         maybe_edges[edge_key] = list(glean_edge_list)
-                    await _cooperative_yield(i, every=8)
+                    # Otherwise keep original version
+                else:
+                    # New edge from gleaning stage
+                    maybe_edges[edge_key] = list(glean_edge_list)
+                await _cooperative_yield(i, every=8)
+
+        # Inject multimodal entity + associations for drawing/table/equation
+        # chunks. Placed before update_chunk_cache_list so the per-chunk
+        # cache write still happens after; placed inside the chunk's
+        # concurrency slot (rather than the centralized post-pass that used
+        # to live in utils_pipeline.augment_chunk_results_with_mm_entities)
+        # so each multimodal chunk benefits from the chunk-level concurrency
+        # already enforced by extract_entities.
+        sidecar_block = chunk_dp.get("sidecar")
+        if isinstance(sidecar_block, dict):
+            sidecar_type = sidecar_block.get("type")
+            sidecar_id = sidecar_block.get("id")
+            if (
+                sidecar_type in {"drawing", "table", "equation"}
+                and isinstance(sidecar_id, str)
+                and sidecar_id
+            ):
+                mm_entity_name = sidecar_id
+                now_ts = int(time.time())
+                mm_nodes_list = maybe_nodes.setdefault(mm_entity_name, [])
+                mm_nodes_list.append(
+                    {
+                        "entity_name": mm_entity_name,
+                        "entity_type": sidecar_type,
+                        # description == the full multimodal chunk content so
+                        # the extracted entity carries the same grounding
+                        # surface the prompt produced; analyze_multimodal's
+                        # description/name field is already inlined there.
+                        "description": chunk_dp.get("content", "") or "",
+                        "source_id": chunk_key,
+                        "file_path": file_path,
+                        "timestamp": now_ts,
+                    }
+                )
+                heading_block = chunk_dp.get("heading")
+                heading_label = ""
+                if isinstance(heading_block, dict):
+                    heading_label = str(heading_block.get("heading") or "").strip()
+                # Omit the "in section ..." clause entirely when the chunk has no
+                # real heading — a literal "unknown" filler would otherwise leak
+                # into the relation description, embedding, and retrieval as noise.
+                location = (
+                    f"in section {heading_label} of document"
+                    if heading_label
+                    else "of document"
+                )
+                mm_display_name = _parse_mm_display_name(
+                    chunk_dp.get("content", "") or "", sidecar_id
+                )
+                for tgt in list(maybe_nodes.keys()):
+                    if tgt == mm_entity_name:
+                        continue
+                    edge_key = (mm_entity_name, tgt)
+                    edge_list = maybe_edges.setdefault(edge_key, [])
+                    edge_list.append(
+                        {
+                            "src_id": mm_entity_name,
+                            "tgt_id": tgt,
+                            "weight": 1.0,
+                            "description": (
+                                f"{tgt} is associated with {sidecar_type} "
+                                f"{mm_display_name} {location} "
+                                f'"{file_path}"'
+                            ),
+                            "keywords": "associated with, contained in",
+                            "source_id": chunk_key,
+                            "file_path": file_path,
+                            "timestamp": now_ts,
+                        }
+                    )
 
         # Batch update chunk's llm_cache_list with all collected cache keys
         if cache_keys_collector and text_chunks_storage:
@@ -3081,10 +3951,7 @@ async def extract_entities(
         relations_count = len(maybe_edges)
         log_message = f"Chunk {processed_chunks} of {total_chunks} extracted {entities_count} Ent + {relations_count} Rel {chunk_key}"
         logger.info(log_message)
-        if pipeline_status is not None:
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = log_message
-                pipeline_status["history_messages"].append(log_message)
+        status_logger.log(log_message)
 
         # Return the extracted nodes and edges for centralized processing
         return maybe_nodes, maybe_edges
@@ -3172,6 +4039,7 @@ async def kg_query(
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
     chunks_vdb: BaseVectorStorage = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> QueryResult | None:
     """
     Execute knowledge graph query and return unified QueryResult object.
@@ -3206,13 +4074,14 @@ async def kg_query(
     if not query:
         return QueryResult(content=PROMPTS["fail_response"])
 
-    if query_param.model_func:
-        use_model_func = query_param.model_func
-    else:
-        use_model_func = global_config["llm_model_func"]
-        # Apply higher priority (5) to query relation LLM function
-        use_model_func = partial(use_model_func, _priority=5)
+    # Apply higher priority (5) to query relation LLM function
+    use_model_func = partial(
+        global_config["role_llm_funcs"]["query"], _priority=DEFAULT_QUERY_PRIORITY
+    )
+    llm_cache_identity = get_llm_cache_identity(global_config, "query")
 
+    if progress_callback:
+        await progress_callback(QueryProgress.EXTRACTING_KEYWORDS)
     hl_keywords, ll_keywords = await get_keywords_from_query(
         query, query_param, global_config, hashing_kv
     )
@@ -3246,6 +4115,7 @@ async def kg_query(
         text_chunks_db,
         query_param,
         chunks_vdb,
+        progress_callback=progress_callback,
     )
 
     if context_result is None:
@@ -3300,6 +4170,9 @@ async def kg_query(
         ll_keywords_str,
         query_param.user_prompt or "",
         query_param.enable_rerank,
+        global_config.get("enable_content_headings", False),
+        "\n<llm_identity>\n",
+        serialize_llm_cache_identity(llm_cache_identity),
     )
 
     cached_result = await handle_cache(
@@ -3313,6 +4186,8 @@ async def kg_query(
         )
         response = cached_response
     else:
+        if progress_callback:
+            await progress_callback(QueryProgress.GENERATING_RESPONSE)
         response = await use_model_func(
             user_query,
             system_prompt=sys_prompt,
@@ -3321,7 +4196,11 @@ async def kg_query(
             stream=query_param.stream,
         )
 
-        if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
+        if (
+            hashing_kv
+            and hashing_kv.global_config.get("enable_llm_cache")
+            and not is_truncated_response(response)
+        ):
             queryparam_dict = {
                 "mode": query_param.mode,
                 "response_type": query_param.response_type,
@@ -3334,6 +4213,9 @@ async def kg_query(
                 "ll_keywords": ll_keywords_str,
                 "user_prompt": query_param.user_prompt or "",
                 "enable_rerank": query_param.enable_rerank,
+                "enable_content_headings": global_config.get(
+                    "enable_content_headings", False
+                ),
             }
             await save_to_cache(
                 hashing_kv,
@@ -3396,11 +4278,116 @@ async def get_keywords_from_query(
     if query_param.hl_keywords or query_param.ll_keywords:
         return query_param.hl_keywords, query_param.ll_keywords
 
-    # Extract keywords using extract_keywords_only function which already supports conversation history
+    # Extract keywords directly from the current query text.
     hl_keywords, ll_keywords = await extract_keywords_only(
         query, query_param, global_config, hashing_kv
     )
     return hl_keywords, ll_keywords
+
+
+def _normalize_keyword_list(raw_values: Any, field_name: str) -> list[str]:
+    """Normalize keyword payloads into a clean list of strings.
+
+    When the field is a plain string (e.g. LLM returned CSV), split on
+    newlines/commas/semicolons. List-shaped payloads are preserved per-item so
+    multi-word phrases that legitimately contain commas are not broken apart.
+    """
+
+    if raw_values is None:
+        return []
+
+    if isinstance(raw_values, str):
+        raw_values = [
+            part.strip()
+            for part in re.split(r"[\n,;]+", raw_values)
+            if part and part.strip()
+        ]
+
+    if not isinstance(raw_values, list):
+        logger.warning(
+            "Keyword extraction field '%s' is not a list: %r",
+            field_name,
+            raw_values,
+        )
+        return []
+
+    normalized: list[str] = []
+    for idx, value in enumerate(raw_values):
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned:
+                normalized.append(cleaned)
+            continue
+
+        logger.warning(
+            "Keyword extraction field '%s' contains non-string element at index %d: %r",
+            field_name,
+            idx,
+            value,
+        )
+
+    return normalized
+
+
+def _parse_keywords_payload(result: Any) -> tuple[bool, list[str], list[str]]:
+    """Parse keyword extraction responses from heterogeneous provider outputs."""
+
+    payload: Any
+
+    if result is None:
+        return False, [], []
+
+    if hasattr(result, "model_dump") and callable(result.model_dump):
+        payload = result.model_dump()
+    elif isinstance(result, dict):
+        payload = result
+    elif isinstance(result, str):
+        cleaned_result = remove_think_tags(result)
+        unfenced_result = strip_markdown_code_fence(cleaned_result)
+        if unfenced_result is not cleaned_result:
+            logger.debug(
+                "Stripped markdown code fence from keyword extraction response"
+            )
+            cleaned_result = unfenced_result
+        try:
+            payload = json.loads(cleaned_result)
+        except json.JSONDecodeError as strict_error:
+            try:
+                payload = json_repair.loads(cleaned_result)
+                logger.warning(
+                    "Keyword extraction response required JSON repair: %s; response: %r",
+                    strict_error,
+                    cleaned_result[:500],
+                )
+            except Exception as repair_error:
+                logger.error(
+                    "JSON parsing error: %s; repair failed: %s; response: %r",
+                    strict_error,
+                    repair_error,
+                    cleaned_result[:500],
+                )
+                return False, [], []
+    else:
+        logger.error(
+            "Unsupported keyword extraction response type: %s",
+            type(result).__name__,
+        )
+        return False, [], []
+
+    if not isinstance(payload, dict):
+        logger.error(
+            "Keyword extraction payload is not a JSON object: %s",
+            type(payload).__name__,
+        )
+        return False, [], []
+
+    hl_keywords = _normalize_keyword_list(
+        payload.get("high_level_keywords"), "high_level_keywords"
+    )
+    ll_keywords = _normalize_keyword_list(
+        payload.get("low_level_keywords"), "low_level_keywords"
+    )
+    return True, hl_keywords, ll_keywords
 
 
 async def extract_keywords_only(
@@ -3418,25 +4405,31 @@ async def extract_keywords_only(
     # 1. Build the examples
     examples = "\n".join(PROMPTS["keywords_extraction_examples"])
 
-    language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
+    addon_params = global_config.get("addon_params") or {}
+    language = global_config.get("_resolved_summary_language")
+    if language is None:
+        language = addon_params.get("language", DEFAULT_SUMMARY_LANGUAGE)
 
     # 2. Handle cache if needed - add cache type for keywords
+    llm_cache_identity = get_llm_cache_identity(global_config, "keyword")
     args_hash = compute_args_hash(
         param.mode,
         text,
         language,
+        "\n<llm_identity>\n",
+        serialize_llm_cache_identity(llm_cache_identity),
     )
     cached_result = await handle_cache(
         hashing_kv, args_hash, text, param.mode, cache_type="keywords"
     )
     if cached_result is not None:
         cached_response, _ = cached_result  # Extract content, ignore timestamp
-        try:
-            keywords_data = json_repair.loads(cached_response)
-            return keywords_data.get("high_level_keywords", []), keywords_data.get(
-                "low_level_keywords", []
-            )
-        except (json.JSONDecodeError, KeyError):
+        is_valid_payload, hl_keywords, ll_keywords = _parse_keywords_payload(
+            cached_response
+        )
+        if is_valid_payload:
+            return hl_keywords, ll_keywords
+        else:
             logger.warning(
                 "Invalid cache format for keywords, proceeding with extraction"
             )
@@ -3455,37 +4448,26 @@ async def extract_keywords_only(
     )
 
     # 4. Call the LLM for keyword extraction
-    if param.model_func:
-        use_model_func = param.model_func
-    else:
-        use_model_func = global_config["llm_model_func"]
-        # Apply higher priority (5) to query relation LLM function
-        use_model_func = partial(use_model_func, _priority=5)
+    # Apply higher priority (5) to query relation LLM function
+    use_model_func = partial(
+        global_config["role_llm_funcs"]["keyword"], _priority=DEFAULT_QUERY_PRIORITY
+    )
 
-    result = await use_model_func(kw_prompt, keyword_extraction=True)
+    result = await use_model_func(kw_prompt, response_format={"type": "json_object"})
 
-    # 5. Parse out JSON from the LLM response
-    result = remove_think_tags(result)
-    try:
-        keywords_data = json_repair.loads(result)
-        if not keywords_data:
-            logger.error("No JSON-like structure found in the LLM respond.")
-            return [], []
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parsing error: {e}")
-        logger.error(f"LLM respond: {result}")
-        return [], []
-
-    hl_keywords = keywords_data.get("high_level_keywords", [])
-    ll_keywords = keywords_data.get("low_level_keywords", [])
+    # 5. Parse out JSON from the LLM response with tolerant provider normalization
+    _, hl_keywords, ll_keywords = _parse_keywords_payload(result)
 
     # 6. Cache only the processed keywords with cache type
-    if hl_keywords or ll_keywords:
+    #    Skip caching when the LLM response was truncated by the token limit:
+    #    the parsed keyword set may be incomplete, and caching it would replay
+    #    the partial result on every later run.
+    if (hl_keywords or ll_keywords) and not is_truncated_response(result):
         cache_data = {
             "high_level_keywords": hl_keywords,
             "low_level_keywords": ll_keywords,
         }
-        if hashing_kv.global_config.get("enable_llm_cache"):
+        if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
             # Save to cache with query parameters
             queryparam_dict = {
                 "mode": param.mode,
@@ -3534,40 +4516,40 @@ async def _get_vector_context(
     Returns:
         List of text chunks with metadata
     """
-    try:
-        # Use chunk_top_k if specified, otherwise fall back to top_k
-        search_top_k = query_param.chunk_top_k or query_param.top_k
-        cosine_threshold = chunks_vdb.cosine_better_than_threshold
+    # No broad try/except here -- mirrors _get_node_data/_get_edge_data, whose
+    # entities_vdb/relationships_vdb queries are also left to propagate. A
+    # backend query failure is not "zero relevant chunks": swallowing it here
+    # let a transient vector-store error surface as a confident "no results"
+    # answer instead of a retrieval failure (and, in mix mode, silently
+    # dropped the vector-search branch while KG results kept flowing).
+    search_top_k = query_param.chunk_top_k or query_param.top_k
+    cosine_threshold = chunks_vdb.cosine_better_than_threshold
 
-        results = await chunks_vdb.query(
-            query, top_k=search_top_k, query_embedding=query_embedding
-        )
-        if not results:
-            logger.info(
-                f"Naive query: 0 chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})"
-            )
-            return []
-
-        valid_chunks = []
-        for result in results:
-            if "content" in result:
-                chunk_with_metadata = {
-                    "content": result["content"],
-                    "created_at": result.get("created_at", None),
-                    "file_path": result.get("file_path", "unknown_source"),
-                    "source_type": "vector",  # Mark the source type
-                    "chunk_id": result.get("id"),  # Add chunk_id for deduplication
-                }
-                valid_chunks.append(chunk_with_metadata)
-
+    results = await chunks_vdb.query(
+        query, top_k=search_top_k, query_embedding=query_embedding
+    )
+    if not results:
         logger.info(
-            f"Naive query: {len(valid_chunks)} chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})"
+            f"Naive query: 0 chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})"
         )
-        return valid_chunks
-
-    except Exception as e:
-        logger.error(f"Error in _get_vector_context: {e}")
         return []
+
+    valid_chunks = []
+    for result in results:
+        if "content" in result:
+            chunk_with_metadata = {
+                "content": result["content"],
+                "created_at": result.get("created_at", None),
+                "file_path": result.get("file_path", "unknown_source"),
+                "source_type": "vector",  # Mark the source type
+                "chunk_id": result.get("id"),  # Add chunk_id for deduplication
+            }
+            valid_chunks.append(chunk_with_metadata)
+
+    logger.info(
+        f"Naive query: {len(valid_chunks)} chunks (chunk_top_k:{search_top_k} cosine:{cosine_threshold})"
+    )
+    return valid_chunks
 
 
 async def _perform_kg_search(
@@ -3580,6 +4562,7 @@ async def _perform_kg_search(
     text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
     chunks_vdb: BaseVectorStorage = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """
     Pure search logic that retrieves raw entities, relations, and vector chunks.
@@ -3637,7 +4620,7 @@ async def _perform_kg_search(
         if texts_to_embed:
             try:
                 all_embeddings = await actual_embedding_func(
-                    texts_to_embed, context="query", _priority=5
+                    texts_to_embed, context="query", _priority=DEFAULT_QUERY_PRIORITY
                 )
                 for i, purpose in enumerate(text_purposes):
                     if purpose == "query":
@@ -3656,6 +4639,8 @@ async def _perform_kg_search(
 
     # Handle local and global modes
     if query_param.mode == "local" and len(ll_keywords) > 0:
+        if progress_callback:
+            await progress_callback(QueryProgress.RETRIEVING_ENTITIES)
         local_entities, local_relations = await _get_node_data(
             ll_keywords,
             knowledge_graph_inst,
@@ -3665,6 +4650,8 @@ async def _perform_kg_search(
         )
 
     elif query_param.mode == "global" and len(hl_keywords) > 0:
+        if progress_callback:
+            await progress_callback(QueryProgress.RETRIEVING_RELATIONS)
         global_relations, global_entities = await _get_edge_data(
             hl_keywords,
             knowledge_graph_inst,
@@ -3675,6 +4662,8 @@ async def _perform_kg_search(
 
     else:  # hybrid or mix mode
         if len(ll_keywords) > 0:
+            if progress_callback:
+                await progress_callback(QueryProgress.RETRIEVING_ENTITIES)
             local_entities, local_relations = await _get_node_data(
                 ll_keywords,
                 knowledge_graph_inst,
@@ -3683,6 +4672,8 @@ async def _perform_kg_search(
                 query_embedding=ll_embedding,
             )
         if len(hl_keywords) > 0:
+            if progress_callback:
+                await progress_callback(QueryProgress.RETRIEVING_RELATIONS)
             global_relations, global_entities = await _get_edge_data(
                 hl_keywords,
                 knowledge_graph_inst,
@@ -3693,6 +4684,8 @@ async def _perform_kg_search(
 
         # Get vector chunks for mix mode
         if query_param.mode == "mix" and chunks_vdb:
+            if progress_callback:
+                await progress_callback(QueryProgress.RETRIEVING_CHUNKS)
             vector_chunks = await _get_vector_context(
                 query,
                 chunks_vdb,
@@ -3951,6 +4944,41 @@ async def _apply_token_truncation(
     }
 
 
+async def _attach_content_headings(
+    chunks: list[dict], text_chunks_db: BaseKVStorage | None
+) -> None:
+    """Backfill the ``content_headings`` field onto chunks in place.
+
+    Vector chunks never carry a ``heading`` field (chunks_vdb does not store it),
+    and the round-robin merge drops the entity/relation headings too. So we look
+    the chunks up by ``chunk_id`` in text_chunks storage and attach the parent
+    heading path. Only chunks that actually have parent headings get the field,
+    so empty paths are omitted from the JSON sent to the LLM.
+
+    Each level is char-capped inside ``format_parent_headings`` and the joined
+    path is token-budgeted against ``DEFAULT_MAX_SECTION_CONTEXT_TOKENS`` here —
+    mirroring the extraction breadcrumb (see ``_truncate_section_context``). The
+    query-context token truncation only keeps/drops whole chunks; it never trims
+    this metadata inside a retained chunk, so a deep heading chain (the per-level
+    cap bounds each level's length, not the number of levels) is bounded here.
+    """
+    if not text_chunks_db or not chunks:
+        return
+    tokenizer = text_chunks_db.global_config.get("tokenizer")
+    chunk_ids = [c.get("chunk_id") for c in chunks]
+    chunk_data_list = await text_chunks_db.get_by_ids(chunk_ids)
+    for chunk, data in zip(chunks, chunk_data_list):
+        if not isinstance(data, dict):
+            continue
+        headings = _truncate_section_context(
+            format_parent_headings(data),
+            tokenizer,
+            DEFAULT_MAX_SECTION_CONTEXT_TOKENS,
+        )
+        if headings:
+            chunk["content_headings"] = headings
+
+
 async def _merge_all_chunks(
     filtered_entities: list[dict],
     filtered_relations: list[dict],
@@ -4050,6 +5078,12 @@ async def _merge_all_chunks(
         f"Round-robin merged chunks: {origin_len} -> {len(merged_chunks)} (deduplicated {origin_len - len(merged_chunks)})"
     )
 
+    # Backfill heading path before token truncation so it counts toward the budget
+    if text_chunks_db and text_chunks_db.global_config.get(
+        "enable_content_headings", False
+    ):
+        await _attach_content_headings(merged_chunks, text_chunks_db)
+
     return merged_chunks
 
 
@@ -4063,6 +5097,7 @@ async def _build_context_str(
     chunk_tracking: dict = None,
     entity_id_to_original: dict = None,
     relation_id_to_original: dict = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """
     Build the final LLM context string with token processing.
@@ -4146,6 +5181,7 @@ async def _build_context_str(
         global_config=global_config,
         source_type=query_param.mode,
         chunk_token_limit=available_chunk_tokens,  # Pass dynamic limit
+        progress_callback=progress_callback,
     )
 
     # Generate reference list from truncated chunks using the new common function
@@ -4157,12 +5193,13 @@ async def _build_context_str(
     # The actual tokens may be slightly less than available_chunk_tokens due to deduplication logic
     chunks_context = []
     for i, chunk in enumerate(truncated_chunks):
-        chunks_context.append(
-            {
-                "reference_id": chunk["reference_id"],
-                "content": chunk["content"],
-            }
-        )
+        entry = {
+            "reference_id": chunk["reference_id"],
+            "content": chunk["content"],
+        }
+        if chunk.get("content_headings"):
+            entry["content_headings"] = chunk["content_headings"]
+        chunks_context.append(entry)
 
     text_units_str = "\n".join(
         json.dumps(text_unit, ensure_ascii=False) for text_unit in chunks_context
@@ -4229,8 +5266,9 @@ async def _build_context_str(
         entity_id_to_original,
         relation_id_to_original,
     )
+    final_data_payload = final_data.get("data", {})
     logger.debug(
-        f"[_build_context_str] Final data after conversion: {len(final_data.get('entities', []))} entities, {len(final_data.get('relationships', []))} relationships, {len(final_data.get('chunks', []))} chunks"
+        f"[_build_context_str] Final data after conversion: {len(final_data_payload.get('entities', []))} entities, {len(final_data_payload.get('relationships', []))} relationships, {len(final_data_payload.get('chunks', []))} chunks"
     )
     return result, final_data
 
@@ -4246,6 +5284,7 @@ async def _build_query_context(
     text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
     chunks_vdb: BaseVectorStorage = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> QueryContextResult | None:
     """
     Main query context building function using the new 4-stage architecture:
@@ -4269,6 +5308,7 @@ async def _build_query_context(
         text_chunks_db,
         query_param,
         chunks_vdb,
+        progress_callback=progress_callback,
     )
 
     if not search_result["final_entities"] and not search_result["final_relations"]:
@@ -4318,6 +5358,7 @@ async def _build_query_context(
         chunk_tracking=search_result["chunk_tracking"],
         entity_id_to_original=truncation_result["entity_id_to_original"],
         relation_id_to_original=truncation_result["relation_id_to_original"],
+        progress_callback=progress_callback,
     )
 
     # Convert keywords strings to lists and add complete metadata to raw_data
@@ -4934,6 +5975,7 @@ async def naive_query(
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
+    text_chunks_db: BaseKVStorage | None = None,
     return_raw_data: Literal[True] = True,
 ) -> dict[str, Any]: ...
 
@@ -4946,6 +5988,7 @@ async def naive_query(
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
+    text_chunks_db: BaseKVStorage | None = None,
     return_raw_data: Literal[False] = False,
 ) -> str | AsyncIterator[str]: ...
 
@@ -4957,6 +6000,8 @@ async def naive_query(
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
+    text_chunks_db: BaseKVStorage | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> QueryResult | None:
     """
     Execute naive query and return unified QueryResult object.
@@ -4982,18 +6027,19 @@ async def naive_query(
     if not query:
         return QueryResult(content=PROMPTS["fail_response"])
 
-    if query_param.model_func:
-        use_model_func = query_param.model_func
-    else:
-        use_model_func = global_config["llm_model_func"]
-        # Apply higher priority (5) to query relation LLM function
-        use_model_func = partial(use_model_func, _priority=5)
+    # Apply higher priority (5) to query relation LLM function
+    use_model_func = partial(
+        global_config["role_llm_funcs"]["query"], _priority=DEFAULT_QUERY_PRIORITY
+    )
+    llm_cache_identity = get_llm_cache_identity(global_config, "query")
 
     tokenizer: Tokenizer = global_config["tokenizer"]
     if not tokenizer:
         logger.error("Tokenizer not found in global configuration.")
         return QueryResult(content=PROMPTS["fail_response"])
 
+    if progress_callback:
+        await progress_callback(QueryProgress.RETRIEVING_CHUNKS)
     chunks = await _get_vector_context(query, chunks_vdb, query_param, None)
 
     if chunks is None or len(chunks) == 0:
@@ -5001,6 +6047,10 @@ async def naive_query(
             "[naive_query] No relevant document chunks found; returning no-result."
         )
         return None
+
+    # Backfill heading path before token truncation so it counts toward the budget
+    if global_config.get("enable_content_headings", False):
+        await _attach_content_headings(chunks, text_chunks_db)
 
     # Calculate dynamic token limit for chunks
     max_total_tokens = getattr(
@@ -5049,6 +6099,7 @@ async def naive_query(
         global_config=global_config,
         source_type="vector",
         chunk_token_limit=available_chunk_tokens,  # Pass dynamic limit
+        progress_callback=progress_callback,
     )
 
     # Generate reference list from processed chunks using the new common function
@@ -5082,12 +6133,13 @@ async def naive_query(
     # Build chunks_context from processed chunks with reference IDs
     chunks_context = []
     for i, chunk in enumerate(processed_chunks_with_ref_ids):
-        chunks_context.append(
-            {
-                "reference_id": chunk["reference_id"],
-                "content": chunk["content"],
-            }
-        )
+        entry = {
+            "reference_id": chunk["reference_id"],
+            "content": chunk["content"],
+        }
+        if chunk.get("content_headings"):
+            entry["content_headings"] = chunk["content_headings"]
+        chunks_context.append(entry)
 
     text_units_str = "\n".join(
         json.dumps(text_unit, ensure_ascii=False) for text_unit in chunks_context
@@ -5131,6 +6183,9 @@ async def naive_query(
         query_param.max_total_tokens,
         query_param.user_prompt or "",
         query_param.enable_rerank,
+        global_config.get("enable_content_headings", False),
+        "\n<llm_identity>\n",
+        serialize_llm_cache_identity(llm_cache_identity),
     )
     cached_result = await handle_cache(
         hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
@@ -5150,7 +6205,11 @@ async def naive_query(
             stream=query_param.stream,
         )
 
-        if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
+        if (
+            hashing_kv
+            and hashing_kv.global_config.get("enable_llm_cache")
+            and not is_truncated_response(response)
+        ):
             queryparam_dict = {
                 "mode": query_param.mode,
                 "response_type": query_param.response_type,
@@ -5161,6 +6220,9 @@ async def naive_query(
                 "max_total_tokens": query_param.max_total_tokens,
                 "user_prompt": query_param.user_prompt or "",
                 "enable_rerank": query_param.enable_rerank,
+                "enable_content_headings": global_config.get(
+                    "enable_content_headings", False
+                ),
             }
             await save_to_cache(
                 hashing_kv,
