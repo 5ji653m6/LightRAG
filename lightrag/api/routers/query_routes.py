@@ -6,11 +6,15 @@ import asyncio
 import json
 import time
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query
 from lightrag.base import QueryParam
-from lightrag.api.utils_api import get_combined_auth_dependency, internal_server_error
+from lightrag.api.utils_api import get_combined_auth_dependency
 from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator
+
+# Global storage for recent query activations (for 3D viewer real-time activation)
+_recent_query_activations: List[Dict[str, Any]] = []
+_MAX_ACTIVATIONS_TO_KEEP = 100
 
 
 class QueryRequest(BaseModel):
@@ -504,7 +508,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 )
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
-            raise internal_server_error(e)
+            raise HTTPException(status_code=500, detail=str(e))
 
     def _build_stream_generator(
         *,
@@ -933,7 +937,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 )
         except Exception as e:
             logger.error(f"Error processing streaming query: {str(e)}", exc_info=True)
-            raise internal_server_error(e)
+            raise HTTPException(status_code=500, detail=str(e))
 
     @router.post(
         "/query/data",
@@ -1340,7 +1344,41 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
             # aquery_data returns the new format with status, message, data, and metadata
             if isinstance(response, dict):
-                return QueryDataResponse(**response)
+                result = QueryDataResponse(**response)
+
+                # Store query activation for 3D viewer real-time activation
+                if result.status == "success" and result.data:
+                    activation_data = {
+                        "timestamp": time.time(),
+                        "query": request.query,
+                        "entities": [],
+                        "relationships": [],
+                    }
+
+                    # Extract entity names from dict
+                    if "entities" in result.data and result.data["entities"]:
+                        activation_data["entities"] = [
+                            e.get("entity_name", str(e)) if isinstance(e, dict) else str(e)
+                            for e in result.data["entities"]
+                        ]
+
+                    # Extract relationship entity pairs from dict
+                    if "relationships" in result.data and result.data["relationships"]:
+                        activation_data["relationships"] = [
+                            {
+                                "src": r.get("src_id", str(r)) if isinstance(r, dict) else str(r),
+                                "tgt": r.get("tgt_id", str(r)) if isinstance(r, dict) else str(r),
+                            }
+                            for r in result.data["relationships"]
+                        ]
+
+                    _recent_query_activations.append(activation_data)
+
+                    # Keep only the most recent activations
+                    while len(_recent_query_activations) > _MAX_ACTIVATIONS_TO_KEEP:
+                        _recent_query_activations.pop(0)
+
+                return result
             else:
                 # Handle unexpected response format
                 return QueryDataResponse(
@@ -1351,6 +1389,45 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 )
         except Exception as e:
             logger.error(f"Error processing data query: {str(e)}", exc_info=True)
-            raise internal_server_error(e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.get(
+        "/query/activations",
+        dependencies=[Depends(combined_auth)],
+        summary="Get recent query activations for 3D viewer",
+        description="Returns recent query results with entity/relationship data for real-time 3D visualization activation",
+    )
+    async def get_query_activations(
+        since: Optional[float] = Query(
+            None,
+            description="Return activations after this timestamp (Unix epoch seconds)",
+        ),
+        limit: int = Query(
+            10,
+            ge=1,
+            le=100,
+            description="Maximum number of activations to return",
+        ),
+    ):
+        """Get recent query activations for 3D viewer real-time activation.
+
+        Returns query results that can be used to activate neurons in the 3D visualization.
+        Optionally filter by timestamp to get only new activations since last poll.
+        """
+        if since is None:
+            # Return most recent activations
+            activations = _recent_query_activations[-limit:]
+        else:
+            # Return activations since timestamp
+            activations = [
+                a for a in _recent_query_activations
+                if a["timestamp"] > since
+            ][-limit:]
+
+        return {
+            "activations": activations,
+            "count": len(activations),
+            "latest_timestamp": activations[-1]["timestamp"] if activations else None,
+        }
 
     return router

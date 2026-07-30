@@ -1,0 +1,1232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GK Brain Knowledge Graph · 3D Galaxy</title>
+<style>
+  :root {
+    --color-bg: #050510;
+    --color-surface: rgba(15, 15, 35, 0.7);
+    --color-border: rgba(100, 120, 200, 0.2);
+    --color-text: #e0e0f0;
+    --color-text-muted: #8888aa;
+    --color-accent: #4a9eff;
+    --color-accent-glow: rgba(74, 158, 255, 0.4);
+    --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --font-mono: 'SF Mono', Monaco, Consolas, monospace;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--font-sans);
+    background: var(--color-bg);
+    color: var(--color-text);
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+  }
+
+  #canvas-container {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: 1;
+  }
+
+  .ui-overlay {
+    position: absolute;
+    z-index: 10;
+    pointer-events: none;
+  }
+
+  .ui-overlay > * {
+    pointer-events: auto;
+  }
+
+  .top-bar {
+    top: 0; left: 0; right: 0;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: linear-gradient(to bottom, rgba(5, 5, 16, 0.8), transparent);
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+
+  .logo-icon {
+    width: 32px; height: 32px;
+    background: linear-gradient(135deg, var(--color-accent), #a855f7);
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+  }
+
+  .stats {
+    display: flex;
+    gap: 24px;
+    font-size: 13px;
+    color: var(--color-text-muted);
+  }
+
+  .stat-value {
+    color: var(--color-accent);
+    font-weight: 600;
+    font-family: var(--font-mono);
+  }
+
+  .side-panel {
+    top: 80px; right: 24px;
+    width: 320px;
+    max-height: calc(100vh - 160px);
+    background: var(--color-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
+    border-radius: 16px;
+    padding: 20px;
+    overflow-y: auto;
+    transition: transform 0.3s ease, opacity 0.3s ease;
+  }
+
+  .side-panel.hidden {
+    transform: translateX(360px);
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .panel-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--color-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 12px;
+  }
+
+  .entity-name {
+    font-size: 20px;
+    font-weight: 700;
+    margin-bottom: 8px;
+    color: var(--color-accent);
+  }
+
+  .entity-description {
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--color-text);
+    margin-bottom: 16px;
+  }
+
+  .entity-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--color-text-muted);
+    font-family: var(--font-mono);
+  }
+
+  .bottom-bar {
+    bottom: 0; left: 0; right: 0;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    background: linear-gradient(to top, rgba(5, 5, 16, 0.8), transparent);
+  }
+
+  .control-btn {
+    background: var(--color-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 10px 16px;
+    color: var(--color-text);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .control-btn:hover {
+    background: rgba(74, 158, 255, 0.1);
+    border-color: var(--color-accent);
+    transform: translateY(-2px);
+  }
+
+  .control-btn:active {
+    transform: translateY(0);
+  }
+
+  .loading-overlay {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    background: var(--color-bg);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    transition: opacity 0.5s ease;
+  }
+
+  .loading-overlay.hidden {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .loading-spinner {
+    width: 60px; height: 60px;
+    border: 3px solid rgba(74, 158, 255, 0.2);
+    border-top-color: var(--color-accent);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  }
+
+  .loading-text {
+    margin-top: 20px;
+    font-size: 16px;
+    color: var(--color-text-muted);
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .tooltip {
+    position: absolute;
+    background: var(--color-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 13px;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    z-index: 20;
+    max-width: 300px;
+  }
+
+  .tooltip.visible {
+    opacity: 1;
+  }
+
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(100, 120, 200, 0.3);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(100, 120, 200, 0.5);
+  }
+
+  .query-panel {
+    top: 80px;
+    left: 24px;
+    display: flex;
+    gap: 8px;
+    z-index: 10;
+  }
+
+  .query-panel input {
+    background: var(--color-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    padding: 10px 16px;
+    color: var(--color-text);
+    font-size: 14px;
+    width: 350px;
+    outline: none;
+    transition: all 0.2s ease;
+  }
+
+  .query-panel input:focus {
+    border-color: var(--color-accent);
+    box-shadow: 0 0 0 3px var(--color-accent-glow);
+  }
+
+  .query-panel input::placeholder {
+    color: var(--color-text-muted);
+  }
+
+  .query-panel button {
+    background: linear-gradient(135deg, var(--color-accent), #a855f7);
+    border: none;
+    border-radius: 12px;
+    padding: 10px 20px;
+    color: white;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+
+  .query-panel button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px var(--color-accent-glow);
+  }
+
+  .query-panel button:active {
+    transform: translateY(0);
+  }
+
+  .activation-log {
+    bottom: 24px;
+    right: 24px;
+    width: 380px;
+    max-height: 400px;
+    background: var(--color-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--color-border);
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    z-index: 10;
+  }
+
+  .log-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--color-border);
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--color-text);
+  }
+
+  .log-close {
+    background: none;
+    border: none;
+    color: var(--color-text-muted);
+    font-size: 20px;
+    cursor: pointer;
+    padding: 0;
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    transition: all 0.2s ease;
+  }
+
+  .log-close:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--color-text);
+  }
+
+  .log-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+  }
+
+  .log-entry {
+    padding: 8px;
+    margin-bottom: 8px;
+    border-radius: 6px;
+    border-left: 3px solid;
+    line-height: 1.5;
+  }
+
+  .log-entry:last-child {
+    margin-bottom: 0;
+  }
+
+  .log-info {
+    background: rgba(74, 158, 255, 0.1);
+    border-left-color: var(--color-accent);
+    color: var(--color-text);
+  }
+
+  .log-success {
+    background: rgba(16, 185, 129, 0.1);
+    border-left-color: #10b981;
+    color: var(--color-text);
+  }
+
+  .log-warning {
+    background: rgba(245, 158, 11, 0.1);
+    border-left-color: #f59e0b;
+    color: var(--color-text);
+  }
+
+  .log-error {
+    background: rgba(239, 68, 68, 0.1);
+    border-left-color: #ef4444;
+    color: var(--color-text);
+  }
+
+  .log-timestamp {
+    color: var(--color-text-muted);
+    font-size: 10px;
+    display: block;
+    margin-bottom: 4px;
+  }
+
+  .log-entities {
+    margin-top: 6px;
+    padding-left: 8px;
+    color: var(--color-text-muted);
+    font-size: 11px;
+  }
+
+  .log-entities span {
+    display: inline-block;
+    background: rgba(255, 255, 255, 0.05);
+    padding: 2px 6px;
+    margin: 2px 2px;
+    border-radius: 3px;
+    font-size: 10px;
+  }
+  .log-edge-info {
+    background: rgba(168, 85, 247, 0.1);
+    border-left-color: #a855f7;
+    color: var(--color-text);
+    font-size: 10px;
+    font-style: italic;
+  }
+</style>
+</head>
+<body>
+
+<div id="canvas-container"></div>
+
+<div class="ui-overlay top-bar">
+  <div class="logo">
+    <div class="logo-icon">⚡</div>
+    <span>GK Brain Knowledge Graph</span>
+  </div>
+  <div class="stats">
+    <div>Entities: <span class="stat-value" id="stat-entities">—</span></div>
+    <div>Edges: <span class="stat-value" id="stat-edges">—</span></div>
+    <div>Clusters: <span class="stat-value" id="stat-clusters">—</span></div>
+  </div>
+</div>
+
+<div class="ui-overlay side-panel hidden" id="side-panel">
+  <div class="panel-title">Entity Details</div>
+  <div class="entity-name" id="entity-name">—</div>
+  <div class="entity-description" id="entity-description">—</div>
+  <div class="entity-meta">
+    <div>Cluster: <span id="entity-cluster">—</span></div>
+    <div>Position: <span id="entity-position">—</span></div>
+    <div>Connections: <span id="entity-connections">—</span></div>
+  </div>
+</div>
+
+<div class="ui-overlay bottom-bar">
+  <button class="control-btn" id="btn-reset-camera">
+    <span>⟲</span> Reset View
+  </button>
+  <button class="control-btn" id="btn-toggle-edges">
+    <span>⋯</span> Toggle Edges
+  </button>
+  <button class="control-btn" id="btn-toggle-labels">
+    <span>Aa</span> Toggle Labels
+  </button>
+  <button class="control-btn" id="btn-auto-rotate">
+    <span>🔄</span> Auto Rotate
+  </button>
+  <button class="control-btn" id="btn-demo-activation">
+    <span>⚡</span> Demo Activation
+  </button>
+</div>
+
+<div class="ui-overlay query-panel" id="query-panel">
+  <input type="text" id="query-input" placeholder="Enter query to activate neurons..." />
+  <button id="query-submit">Query</button>
+</div>
+
+<div class="ui-overlay activation-log" id="activation-log">
+  <div class="log-header">
+    <span>🔍 Query Log</span>
+    <button class="log-close" id="log-close">×</button>
+  </div>
+  <div class="log-content" id="log-content">
+    <div class="log-entry log-info">Ready to query. Enter a search term above.</div>
+  </div>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<div class="loading-overlay" id="loading">
+  <div class="loading-spinner"></div>
+  <div class="loading-text">Loading knowledge graph...</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+const API_BASE = '__API_BASE__';
+const BINARY_URL = `${API_BASE}/graph3d/layout.bin`;
+const META_URL = `${API_BASE}/graph3d/layout_meta.json`;
+const ACTIVATIONS_URL = `${API_BASE}/query/activations`;
+
+const POINT_SIZE = 0.012;
+const SPHERE_SEGMENTS_W = 48;
+const SPHERE_SEGMENTS_H = 32;
+
+// Cluster color palette (10 distinct colors)
+const CLUSTER_COLORS = [
+  0x2a5a9f, 0x6835a7, 0x0a7951, 0x956e0b, 0x8f2424,
+  0x047684, 0x5b3c96, 0x547c0e, 0x99550e, 0x942c5f
+];
+
+let scene, camera, renderer, composer, controls;
+let pointsMesh, edgesMesh;
+let entityData = null;
+let edgeData = null;
+let hoveredEntity = -1;
+let selectedEntity = -1;
+let showEdges = true;
+let showLabels = false;
+
+// Neuron activation state
+let entityNameToIndex = new Map();
+let activatedEntities = new Set();
+let activationAnimation = null;
+let activatedEdgesMesh = null; // Separate mesh for activated edges only
+
+// Real-time polling for query activations
+let lastActivationTimestamp = null;
+let pollingInterval = null;
+const POLL_INTERVAL_MS = 2000; // Poll every 2 seconds
+
+// Logging functions
+function addLog(message, type = 'info', details = null) {
+  const logContent = document.getElementById('log-content');
+  const timestamp = new Date().toLocaleTimeString();
+
+  const entry = document.createElement('div');
+  entry.className = `log-entry log-${type}`;
+
+  let html = `<span class="log-timestamp">${timestamp}</span>${message}`;
+
+  if (details) {
+    html += `<div class="log-entities">${details}</div>`;
+  }
+
+  entry.innerHTML = html;
+  logContent.appendChild(entry);
+
+  // Auto-scroll to bottom
+  logContent.scrollTop = logContent.scrollHeight;
+
+  // Keep only last 50 entries
+  while (logContent.children.length > 50) {
+    logContent.removeChild(logContent.firstChild);
+  }
+}
+
+function formatEntityList(entities, maxShow = 10) {
+  const shown = entities.slice(0, maxShow);
+  let html = shown.map(e => `<span>${e}</span>`).join('');
+  if (entities.length > maxShow) {
+    html += `<span>+${entities.length - maxShow} more</span>`;
+  }
+  return html;
+}
+
+async function loadData() {
+  try {
+    // Load metadata
+    const metaResp = await fetch(META_URL);
+    if (!metaResp.ok) throw new Error('Failed to load metadata');
+    const meta = await metaResp.json();
+
+    entityData = meta.entities;
+    edgeData = meta.edges;
+
+    document.getElementById('stat-entities').textContent = meta.entity_count.toLocaleString();
+    document.getElementById('stat-edges').textContent = meta.edge_count.toLocaleString();
+    document.getElementById('stat-clusters').textContent = meta.cluster_count.toLocaleString();
+
+    // Load binary layout
+    const binResp = await fetch(BINARY_URL);
+    if (!binResp.ok) throw new Error('Failed to load binary layout');
+    const binBuffer = await binResp.arrayBuffer();
+
+    // Parse binary format
+    const positions = new Float32Array(binBuffer, 0, meta.entity_count * 3);
+    const clusters = new Uint16Array(binBuffer, meta.entity_count * 3 * 4, meta.entity_count);
+
+    // Update entity data with positions
+    for (let i = 0; i < meta.entity_count; i++) {
+      entityData[i].x = positions[i * 3];
+      entityData[i].y = positions[i * 3 + 1];
+      entityData[i].z = positions[i * 3 + 2];
+      entityData[i].cluster = clusters[i];
+    }
+
+    return true;
+  } catch (err) {
+    console.error('Failed to load data:', err);
+    return false;
+  }
+}
+
+function initScene() {
+  const container = document.getElementById('canvas-container');
+  const width = container.clientWidth;
+  const height = container.clientHeight;
+
+  // Scene
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x050510);
+
+  // Camera
+  camera = new THREE.PerspectiveCamera(55, width / height, 0.1, 2000);
+  camera.position.set(5, 5, 5);
+
+  // Renderer
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setSize(width, height);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.25;
+  container.appendChild(renderer.domElement);
+
+  // Post-processing
+  composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+
+  const bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(width, height),
+    0.6,  // strength (reduced for better activation visibility)
+    0.4,  // radius
+    0.3   // threshold (increased so only activated entities glow brightly)
+  );
+  composer.addPass(bloomPass);
+
+  // Controls
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.05;
+  controls.rotateSpeed = 0.5;
+  controls.zoomSpeed = 1.2;
+  controls.autoRotate = true;  // Enable gentle auto-rotation by default
+  controls.autoRotateSpeed = 0.45;
+
+  // Resize handler
+  window.addEventListener('resize', () => {
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    renderer.setSize(w, h);
+    composer.setSize(w, h);
+  });
+}
+
+function createPoints() {
+  if (!entityData) return;
+
+  const geometry = new THREE.BufferGeometry();
+  const positions = new Float32Array(entityData.length * 3);
+  const colors = new Float32Array(entityData.length * 3);
+  const sizes = new Float32Array(entityData.length);
+
+  for (let i = 0; i < entityData.length; i++) {
+    const entity = entityData[i];
+    positions[i * 3] = entity.x;
+    positions[i * 3 + 1] = entity.y;
+    positions[i * 3 + 2] = entity.z;
+
+    const color = new THREE.Color(CLUSTER_COLORS[entity.cluster % CLUSTER_COLORS.length]);
+    colors[i * 3] = color.r;
+    colors[i * 3 + 1] = color.g;
+    colors[i * 3 + 2] = color.b;
+
+    sizes[i] = POINT_SIZE;
+
+    // Build name-to-index map
+    entityNameToIndex.set(entity.name, i);
+  }
+
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+  const material = new THREE.PointsMaterial({
+    size: POINT_SIZE,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.4,
+    sizeAttenuation: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+  });
+
+  pointsMesh = new THREE.Points(geometry, material);
+  scene.add(pointsMesh);
+}
+
+// Neuron activation functions
+function activateEntities(entityNames, duration = 3000) {
+  if (!pointsMesh || !entityData) return;
+
+  // Clear previous activations
+  activatedEntities.clear();
+  if (activationAnimation) {
+    cancelAnimationFrame(activationAnimation);
+  }
+
+  // Remove previous activated edges mesh if it exists
+  if (activatedEdgesMesh) {
+    scene.remove(activatedEdgesMesh);
+    activatedEdgesMesh.geometry.dispose();
+    activatedEdgesMesh.material.dispose();
+    activatedEdgesMesh = null;
+  }
+
+  // Keep original edges hidden during activation
+  if (edgesMesh) {
+    edgesMesh.visible = false;
+  }
+
+  // Find entity indices
+  const indices = [];
+  const notFound = [];
+  for (const name of entityNames) {
+    const idx = entityNameToIndex.get(name);
+    if (idx !== undefined) {
+      indices.push(idx);
+      activatedEntities.add(idx);
+    } else {
+      notFound.push(name);
+    }
+  }
+
+  if (indices.length === 0) {
+    addLog(`⚠️ No entities found in point cloud. Try a different query.`, 'warning');
+    return;
+  }
+
+  if (notFound.length > 0) {
+    console.log(`Entities not found in point cloud: ${notFound.length}/${entityNames.length}`);
+  }
+
+  // Create activated edges mesh (only edges between activated entities)
+  if (edgeData) {
+    const activatedPositions = [];
+    const activatedColors = [];
+
+    for (const [srcIdx, tgtIdx] of edgeData) {
+      if (srcIdx >= entityData.length || tgtIdx >= entityData.length) continue;
+
+      const srcActivated = indices.includes(srcIdx);
+      const tgtActivated = indices.includes(tgtIdx);
+
+      // Only include edges where BOTH endpoints are activated
+      if (srcActivated && tgtActivated) {
+        const src = entityData[srcIdx];
+        const tgt = entityData[tgtIdx];
+
+        activatedPositions.push(src.x, src.y, src.z);
+        activatedPositions.push(tgt.x, tgt.y, tgt.z);
+
+        // Bright white color
+        activatedColors.push(1, 1, 1);
+        activatedColors.push(1, 1, 1);
+      }
+    }
+
+    if (activatedPositions.length > 0) {
+      const edgeGeometry = new THREE.BufferGeometry();
+      edgeGeometry.setAttribute('position', new THREE.Float32BufferAttribute(activatedPositions, 3));
+      edgeGeometry.setAttribute('color', new THREE.Float32BufferAttribute(activatedColors, 3));
+
+      const edgeMaterial = new THREE.LineBasicMaterial({
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.8,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        linewidth: 2
+      });
+
+      activatedEdgesMesh = new THREE.LineSegments(edgeGeometry, edgeMaterial);
+      scene.add(activatedEdgesMesh);
+
+      const edgeCount = activatedPositions.length / 6;
+      addLog(`🔗 Created <strong>${edgeCount}</strong> activated edges`, 'info');
+    }
+  }
+
+  // Start pulsing animation
+  const startTime = Date.now();
+  const colors = pointsMesh.geometry.attributes.color.array;
+  const sizes = pointsMesh.geometry.attributes.size.array;
+  const originalColors = new Float32Array(colors.length);
+  const originalSizes = new Float32Array(sizes.length);
+  originalColors.set(colors);
+  originalSizes.set(sizes);
+
+  function pulse() {
+    const elapsed = Date.now() - startTime;
+
+    // Pulse for first 2 seconds, then stay bright
+    const pulseIntensity = elapsed < 2000
+      ? Math.sin((elapsed / 2000) * Math.PI * 4) * 0.5 + 0.5
+      : 1.0;
+
+    // Activate entities
+    for (const idx of indices) {
+      const baseColor = new THREE.Color(CLUSTER_COLORS[entityData[idx].cluster % CLUSTER_COLORS.length]);
+      const brightColor = baseColor.clone().lerp(new THREE.Color(0xffffff), pulseIntensity * 0.9);
+      colors[idx * 3] = brightColor.r;
+      colors[idx * 3 + 1] = brightColor.g;
+      colors[idx * 3 + 2] = brightColor.b;
+      sizes[idx] = POINT_SIZE * (1 + pulseIntensity * 3);
+    }
+
+    // Propagate to neighbor entities
+    if (edgeData) {
+      for (const [srcIdx, tgtIdx] of edgeData) {
+        if (indices.includes(srcIdx) || indices.includes(tgtIdx)) {
+          const neighborIdx = indices.includes(srcIdx) ? tgtIdx : srcIdx;
+          if (!indices.includes(neighborIdx)) {
+            const neighborColor = new THREE.Color(CLUSTER_COLORS[entityData[neighborIdx].cluster % CLUSTER_COLORS.length]);
+            const dimPulse = pulseIntensity * 0.5;
+            const dimColor = neighborColor.clone().lerp(new THREE.Color(0xffffff), dimPulse);
+            colors[neighborIdx * 3] = dimColor.r;
+            colors[neighborIdx * 3 + 1] = dimColor.g;
+            colors[neighborIdx * 3 + 2] = dimColor.b;
+            sizes[neighborIdx] = POINT_SIZE * (1 + dimPulse * 1.5);
+          }
+        }
+      }
+    }
+
+    // Pulse the activated edges mesh
+    if (activatedEdgesMesh) {
+      activatedEdgesMesh.material.opacity = 0.4 + pulseIntensity * 0.4;
+    }
+
+    pointsMesh.geometry.attributes.color.needsUpdate = true;
+    pointsMesh.geometry.attributes.size.needsUpdate = true;
+
+    // Keep animating to maintain the bright state
+    activationAnimation = requestAnimationFrame(pulse);
+  }
+
+  pulse();
+}
+
+async function queryAndActivate(queryText) {
+  addLog(`🔍 Querying: <strong>${queryText}</strong>`, 'info');
+
+  try {
+    const response = await fetch(`${API_BASE}/query/data`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        query: queryText,
+        mode: 'hybrid',
+        top_k: 20,
+        chunk_top_k: 10
+      })
+    });
+
+    if (!response.ok) {
+      addLog(`❌ Query failed: ${response.statusText}`, 'error');
+      console.error('Query failed:', response.statusText);
+      return;
+    }
+
+    const result = await response.json();
+    if (result.status === 'success' && result.data) {
+      const entityNames = [];
+
+      // Collect entity names from results
+      if (result.data.entities) {
+        entityNames.push(...result.data.entities.map(e => e.entity_name));
+      }
+
+      // Collect entity names from relationships
+      if (result.data.relationships) {
+        for (const rel of result.data.relationships) {
+          entityNames.push(rel.src_id, rel.tgt_id);
+        }
+      }
+
+      // Remove duplicates
+      const uniqueEntities = [...new Set(entityNames)];
+
+      // Log the results
+      const entityCount = result.data.entities ? result.data.entities.length : 0;
+      const relCount = result.data.relationships ? result.data.relationships.length : 0;
+      addLog(
+        `✅ Found <strong>${entityCount}</strong> entities, <strong>${relCount}</strong> relationships`,
+        'success',
+        formatEntityList(uniqueEntities, 15)
+      );
+
+      // Activate the entities
+      activateEntities(uniqueEntities, 4000);
+      addLog(`⚡ Activated <strong>${uniqueEntities.length}</strong> neurons`, 'success');
+      addLog(`💡 Only edges between activated entities are shown. Stays bright until next query.`, 'info');
+    } else {
+      addLog(`⚠️ Query returned no results`, 'warning');
+    }
+  } catch (error) {
+    addLog(`❌ Query error: ${error.message}`, 'error');
+    console.error('Query error:', error);
+  }
+}
+
+function createEdges() {
+  if (!edgeData || !entityData) return;
+
+  const positions = [];
+  const colors = [];
+
+  for (const [srcIdx, tgtIdx] of edgeData) {
+    if (srcIdx >= entityData.length || tgtIdx >= entityData.length) continue;
+
+    const src = entityData[srcIdx];
+    const tgt = entityData[tgtIdx];
+
+    positions.push(src.x, src.y, src.z);
+    positions.push(tgt.x, tgt.y, tgt.z);
+
+    const color = new THREE.Color(CLUSTER_COLORS[src.cluster % CLUSTER_COLORS.length]);
+    colors.push(color.r, color.g, color.b);
+    colors.push(color.r, color.g, color.b);
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+  const material = new THREE.LineBasicMaterial({
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.15,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+  });
+
+  edgesMesh = new THREE.LineSegments(geometry, material);
+  scene.add(edgesMesh);
+}
+
+function frameAll(padding = 0.8) {
+  if (!entityData || entityData.length === 0) return;
+
+  // Compute bounding box
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+
+  for (const entity of entityData) {
+    const x = entity.x, y = entity.y, z = entity.z;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    if (z < minZ) minZ = z;
+    if (z > maxZ) maxZ = z;
+  }
+
+  // Compute center and radius
+  const cx = (minX + maxX) * 0.5;
+  const cy = (minY + maxY) * 0.5;
+  const cz = (minZ + maxZ) * 0.5;
+  const sx = maxX - minX;
+  const sy = maxY - minY;
+  const sz = maxZ - minZ;
+  const radius = 0.5 * Math.sqrt(sx * sx + sy * sy + sz * sz) || 1e-3;
+
+  // Calculate camera distance based on FOV
+  const vFOV = THREE.MathUtils.degToRad(camera.fov);
+  const hFOV = 2 * Math.atan(Math.tan(vFOV * 0.5) * camera.aspect);
+  const fov = Math.min(vFOV, hFOV);
+  const dist = (radius / Math.sin(fov * 0.5)) * padding;
+
+  // Position camera
+  controls.target.set(cx, cy, cz);
+  camera.position.set(cx - dist, cy, cz);
+  camera.near = Math.max(0.01, dist / 100);
+  camera.far = dist * 60;
+  camera.updateProjectionMatrix();
+
+  // Set zoom limits
+  controls.minDistance = dist * 0.05;
+  controls.maxDistance = dist * 20;
+  controls.update();
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  composer.render();
+}
+
+function setupInteraction() {
+  const raycaster = new THREE.Raycaster();
+  raycaster.params.Points.threshold = POINT_SIZE * 2;
+  const mouse = new THREE.Vector2();
+  const tooltip = document.getElementById('tooltip');
+
+  renderer.domElement.addEventListener('mousemove', (event) => {
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObject(pointsMesh);
+
+    if (intersects.length > 0) {
+      const idx = intersects[0].index;
+      if (idx !== hoveredEntity) {
+        hoveredEntity = idx;
+        const entity = entityData[idx];
+        tooltip.textContent = entity.name;
+        tooltip.classList.add('visible');
+      }
+      tooltip.style.left = `${event.clientX + 12}px`;
+      tooltip.style.top = `${event.clientY + 12}px`;
+    } else {
+      hoveredEntity = -1;
+      tooltip.classList.remove('visible');
+    }
+  });
+
+  renderer.domElement.addEventListener('click', () => {
+    if (hoveredEntity >= 0) {
+      selectedEntity = hoveredEntity;
+      showEntityDetails(selectedEntity);
+    }
+  });
+}
+
+function showEntityDetails(idx) {
+  const panel = document.getElementById('side-panel');
+  const entity = entityData[idx];
+
+  document.getElementById('entity-name').textContent = entity.name;
+  document.getElementById('entity-description').textContent = entity.description || 'No description available.';
+  document.getElementById('entity-cluster').textContent = entity.cluster;
+  document.getElementById('entity-position').textContent =
+    `(${entity.x.toFixed(2)}, ${entity.y.toFixed(2)}, ${entity.z.toFixed(2)})`;
+
+  // Count connections
+  const connections = edgeData.filter(([s, t]) => s === idx || t === idx).length;
+  document.getElementById('entity-connections').textContent = connections;
+
+  panel.classList.remove('hidden');
+}
+
+// UI controls
+document.getElementById('btn-reset-camera').addEventListener('click', () => {
+  frameAll();
+});
+
+document.getElementById('btn-toggle-edges').addEventListener('click', () => {
+  showEdges = !showEdges;
+  if (edgesMesh) edgesMesh.visible = showEdges;
+  if (activatedEdgesMesh) activatedEdgesMesh.visible = showEdges;
+});
+
+document.getElementById('btn-toggle-labels').addEventListener('click', () => {
+  showLabels = !showLabels;
+  // TODO: Implement label rendering with CSS2DRenderer
+});
+
+// Query panel - submit button
+document.getElementById('query-submit').addEventListener('click', () => {
+  const queryInput = document.getElementById('query-input');
+  const queryText = queryInput.value.trim();
+  if (queryText) {
+    queryAndActivate(queryText);
+  }
+});
+
+// Query panel - enter key
+document.getElementById('query-input').addEventListener('keypress', (e) => {
+  if (e.key === 'Enter') {
+    const queryText = e.target.value.trim();
+    if (queryText) {
+      queryAndActivate(queryText);
+    }
+  }
+});
+
+// Demo activation button
+document.getElementById('btn-demo-activation').addEventListener('click', () => {
+  if (!entityData || entityData.length === 0) return;
+
+  // Pick 10 random entities to activate
+  const randomEntities = [];
+  for (let i = 0; i < 10; i++) {
+    const idx = Math.floor(Math.random() * entityData.length);
+    randomEntities.push(entityData[idx].name);
+  }
+
+  addLog(`🎲 Demo mode: Activating 10 random entities`, 'info', formatEntityList(randomEntities));
+  activateEntities(randomEntities, 3000);
+});
+
+// Auto-rotate toggle button
+document.getElementById('btn-auto-rotate').addEventListener('click', () => {
+  controls.autoRotate = !controls.autoRotate;
+  const btn = document.getElementById('btn-auto-rotate');
+  btn.style.opacity = controls.autoRotate ? '1' : '0.5';
+  addLog(
+    controls.autoRotate ? '🔄 Auto-rotate enabled' : '⏸️ Auto-rotate disabled',
+    'info'
+  );
+});
+
+// Log panel close button
+document.getElementById('log-close').addEventListener('click', () => {
+  document.getElementById('activation-log').style.display = 'none';
+});
+
+// Poll for new query activations from other sources
+async function pollForActivations() {
+  try {
+    const url = lastActivationTimestamp
+      ? `${ACTIVATIONS_URL}?since=${lastActivationTimestamp}&limit=5`
+      : `${ACTIVATIONS_URL}?limit=5`;
+
+    const response = await fetch(url);
+    if (!response.ok) return;
+
+    const data = await response.json();
+
+    if (data.activations && data.activations.length > 0) {
+      // Process each activation
+      for (const activation of data.activations) {
+        const entityNames = [];
+
+        // Collect entity names
+        if (activation.entities) {
+          entityNames.push(...activation.entities);
+        }
+
+        // Collect from relationships
+        if (activation.relationships) {
+          for (const rel of activation.relationships) {
+            entityNames.push(rel.src, rel.tgt);
+          }
+        }
+
+        const uniqueEntities = [...new Set(entityNames)];
+
+        if (uniqueEntities.length > 0) {
+          // Log the activation
+          addLog(
+            `🌐 External query: <strong>"${activation.query}"</strong>`,
+            'info'
+          );
+          addLog(
+            `✅ Found <strong>${activation.entities?.length || 0}</strong> entities`,
+            'success',
+            formatEntityList(uniqueEntities, 15)
+          );
+
+          // Activate the entities
+          activateEntities(uniqueEntities, 4000);
+          addLog(`⚡ Activated <strong>${uniqueEntities.length}</strong> neurons`, 'success');
+        }
+      }
+
+      // Update timestamp
+      lastActivationTimestamp = data.latest_timestamp;
+    }
+  } catch (error) {
+    console.error('Polling error:', error);
+  }
+}
+
+// Start polling after data is loaded
+function startPolling() {
+  if (pollingInterval) return; // Already polling
+
+  pollingInterval = setInterval(pollForActivations, POLL_INTERVAL_MS);
+  addLog('🔄 Real-time activation monitoring enabled', 'info');
+}
+
+function stopPolling() {
+  if (pollingInterval) {
+    clearInterval(pollingInterval);
+    pollingInterval = null;
+    addLog('⏸️ Real-time activation monitoring paused', 'info');
+  }
+}
+
+async function init() {
+  const loaded = await loadData();
+  if (!loaded) {
+    document.getElementById('loading').innerHTML = `
+      <div style="text-align: center; color: var(--color-text-muted);">
+        <div style="font-size: 48px; margin-bottom: 16px;">⚠</div>
+        <div style="font-size: 18px; margin-bottom: 8px;">Failed to load knowledge graph</div>
+        <div style="font-size: 14px;">Make sure the layout has been computed.</div>
+      </div>
+    `;
+    return;
+  }
+
+  initScene();
+  createPoints();
+  createEdges();
+  frameAll();  // Position camera to fit all data
+  setupInteraction();
+  animate();
+
+  // Start polling for external query activations
+  startPolling();
+
+  // Hide loading overlay
+  setTimeout(() => {
+    document.getElementById('loading').classList.add('hidden');
+  }, 500);
+}
+
+init();
+</script>
+
+</body>
+</html>
