@@ -529,6 +529,12 @@ let lastActivationTimestamp = null;
 let pollingInterval = null;
 const POLL_INTERVAL_MS = 2000; // Poll every 2 seconds
 
+// Queue system for sequential activation processing
+let activationQueue = [];
+let isProcessingQueue = false;
+const ACTIVATION_DISPLAY_DURATION = 4000; // How long each activation stays visible
+const QUEUE_PROCESSING_DELAY = 500; // Delay between processing queued activations
+
 // Logging functions
 function addLog(message, type = 'info', details = null) {
   const logContent = document.getElementById('log-content');
@@ -902,10 +908,19 @@ async function queryAndActivate(queryText) {
         formatEntityList(uniqueEntities, 15)
       );
 
-      // Activate the entities
-      activateEntities(uniqueEntities, 4000);
-      addLog(`⚡ Activated <strong>${uniqueEntities.length}</strong> neurons`, 'success');
-      addLog(`💡 Only edges between activated entities are shown. Stays bright until next query.`, 'info');
+      // Add to queue instead of activating directly
+      activationQueue.push({
+        query: queryText,
+        entities: uniqueEntities,
+        entityCount: entityCount,
+        timestamp: Date.now() / 1000,
+        isManual: true
+      });
+
+      // Start processing queue if not already processing
+      if (!isProcessingQueue) {
+        processActivationQueue();
+      }
     } else {
       addLog(`⚠️ Query returned no results`, 'warning');
     }
@@ -1136,7 +1151,7 @@ async function pollForActivations() {
     const data = await response.json();
 
     if (data.activations && data.activations.length > 0) {
-      // Process each activation
+      // Add each activation to the queue
       for (const activation of data.activations) {
         const entityNames = [];
 
@@ -1155,25 +1170,23 @@ async function pollForActivations() {
         const uniqueEntities = [...new Set(entityNames)];
 
         if (uniqueEntities.length > 0) {
-          // Log the activation
-          addLog(
-            `🌐 External query: <strong>"${activation.query}"</strong>`,
-            'info'
-          );
-          addLog(
-            `✅ Found <strong>${activation.entities?.length || 0}</strong> entities`,
-            'success',
-            formatEntityList(uniqueEntities, 15)
-          );
-
-          // Activate the entities
-          activateEntities(uniqueEntities, 4000);
-          addLog(`⚡ Activated <strong>${uniqueEntities.length}</strong> neurons`, 'success');
+          // Add to queue
+          activationQueue.push({
+            query: activation.query,
+            entities: uniqueEntities,
+            entityCount: activation.entities?.length || 0,
+            timestamp: activation.timestamp
+          });
         }
       }
 
       // Update timestamp
       lastActivationTimestamp = data.latest_timestamp;
+
+      // Start processing queue if not already processing
+      if (!isProcessingQueue) {
+        processActivationQueue();
+      }
     }
   } catch (error) {
     console.error('Polling error:', error);
@@ -1186,6 +1199,55 @@ function startPolling() {
 
   pollingInterval = setInterval(pollForActivations, POLL_INTERVAL_MS);
   addLog('🔄 Real-time activation monitoring enabled', 'info');
+}
+
+// Process activation queue sequentially
+async function processActivationQueue() {
+  if (isProcessingQueue || activationQueue.length === 0) {
+    return;
+  }
+
+  isProcessingQueue = true;
+
+  while (activationQueue.length > 0) {
+    const activation = activationQueue.shift();
+
+    // Log the activation (different message for manual vs external queries)
+    if (activation.isManual) {
+      addLog(
+        `🔍 Manual query: <strong>"${activation.query}"</strong>`,
+        'info'
+      );
+    } else {
+      addLog(
+        `🌐 External query: <strong>"${activation.query}"</strong>`,
+        'info'
+      );
+    }
+
+    addLog(
+      `✅ Found <strong>${activation.entityCount}</strong> entities`,
+      'success',
+      formatEntityList(activation.entities, 15)
+    );
+
+    // Activate the entities
+    activateEntities(activation.entities, ACTIVATION_DISPLAY_DURATION);
+    addLog(`⚡ Activated <strong>${activation.entities.length}</strong> neurons`, 'success');
+
+    // If there are more items in queue, show queue status
+    if (activationQueue.length > 0) {
+      addLog(
+        `⏳ ${activationQueue.length} more query${activationQueue.length > 1 ? 'ies' : 'y'} queued...`,
+        'info'
+      );
+    }
+
+    // Wait for activation to be visible before processing next
+    await new Promise(resolve => setTimeout(resolve, ACTIVATION_DISPLAY_DURATION + QUEUE_PROCESSING_DELAY));
+  }
+
+  isProcessingQueue = false;
 }
 
 function stopPolling() {
