@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, field_validator
 # Global storage for recent query activations (for 3D viewer real-time activation)
 _recent_query_activations: List[Dict[str, Any]] = []
 _MAX_ACTIVATIONS_TO_KEEP = 100
+_ACTIVATION_TTL_SECONDS = 60  # Activations expire after 60 seconds
 
 
 class QueryRequest(BaseModel):
@@ -1374,6 +1375,21 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
                     _recent_query_activations.append(activation_data)
 
+                    # Log the activation
+                    entity_count = len(activation_data["entities"])
+                    rel_count = len(activation_data["relationships"])
+                    logger.info(
+                        f"Query activation recorded: '{request.query}' "
+                        f"({entity_count} entities, {rel_count} relationships)"
+                    )
+
+                    # Clean up expired activations (older than TTL)
+                    current_time = time.time()
+                    _recent_query_activations[:] = [
+                        a for a in _recent_query_activations
+                        if current_time - a["timestamp"] < _ACTIVATION_TTL_SECONDS
+                    ]
+
                     # Keep only the most recent activations
                     while len(_recent_query_activations) > _MAX_ACTIVATIONS_TO_KEEP:
                         _recent_query_activations.pop(0)
@@ -1413,7 +1429,15 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
         Returns query results that can be used to activate neurons in the 3D visualization.
         Optionally filter by timestamp to get only new activations since last poll.
+        Activations older than 60 seconds are automatically expired.
         """
+        # Clean up expired activations
+        current_time = time.time()
+        _recent_query_activations[:] = [
+            a for a in _recent_query_activations
+            if current_time - a["timestamp"] < _ACTIVATION_TTL_SECONDS
+        ]
+
         if since is None:
             # Return most recent activations
             activations = _recent_query_activations[-limit:]
@@ -1423,6 +1447,13 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 a for a in _recent_query_activations
                 if a["timestamp"] > since
             ][-limit:]
+
+        # Log the retrieval
+        if activations:
+            logger.debug(
+                f"Retrieved {len(activations)} activations "
+                f"(total in queue: {len(_recent_query_activations)})"
+            )
 
         return {
             "activations": activations,
