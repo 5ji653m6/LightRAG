@@ -1995,11 +1995,17 @@ function showClusterInfo(clusterId) {
   if (!clustersData) return;
 
   const cluster = clustersData.clusters.find(c => c.cluster_id === clusterId);
-  if (!cluster) return;
-
-  // The cluster legend lives inside the side-panel (Entity Details)
   const legend = document.getElementById('cluster-legend');
   if (!legend) return;
+
+  if (!cluster) {
+    // Cluster analysis not available for this cluster
+    document.getElementById('cluster-label').textContent = `Cluster ${clusterId}`;
+    document.getElementById('cluster-stats').innerHTML = '';
+    document.getElementById('cluster-entities').innerHTML =
+      '<div style="color: var(--color-text-muted); font-size: 11px; font-style: italic;">Detailed analysis not available for this cluster.</div>';
+    return;
+  }
 
   // Display cluster label
   document.getElementById('cluster-label').textContent = `Cluster ${clusterId}: ${cluster.label}`;
