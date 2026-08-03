@@ -5,6 +5,7 @@ from pathlib import Path
 
 import asyncio
 import json
+import logging
 import re
 import json_repair
 from typing import Any, AsyncIterator, overload, Literal, Callable, Awaitable
@@ -18,7 +19,6 @@ from lightrag.utils import (
     logger,
     compute_mdhash_id,
     Tokenizer,
-    is_float_regex,
     sanitize_and_normalize_extracted_text,
     sanitize_text_for_encoding,
     repair_vlm_json_escape_damage_nested,
@@ -26,7 +26,9 @@ from lightrag.utils import (
     tolerant_load_json_dict,
     pack_user_ass_to_openai_messages,
     split_string_by_multi_markers,
-    truncate_list_by_token_size,
+    acount_tokens,
+    atruncate_list_by_token_size,
+    run_in_tokenizer_executor,
     compute_args_hash,
     handle_cache,
     save_to_cache,
@@ -457,7 +459,7 @@ async def _handle_entity_relation_summary(
                     )
                     current_chunk = []  # next group is empty
                     current_tokens = 0
-                else:  # curren_chunk is ready for summary in reduce phase
+                else:  # current_chunk is ready for summary in reduce phase
                     chunks.append(current_chunk)
                     current_chunk = [desc]  # leave it for next group
                     current_tokens = desc_tokens
@@ -534,7 +536,7 @@ async def _summarize_descriptions(
     json_descriptions = [{"Description": desc} for desc in description_list]
 
     # Use truncate_list_by_token_size for length truncation
-    truncated_json_descriptions = truncate_list_by_token_size(
+    truncated_json_descriptions = await atruncate_list_by_token_size(
         json_descriptions,
         key=lambda x: json.dumps(x, ensure_ascii=False),
         max_token_size=summary_context_size,
@@ -732,11 +734,8 @@ def _handle_single_relationship_extraction(
             return None
 
         edge_source_id = chunk_key
-        weight = (
-            float(record_attributes[-1].strip('"').strip("'"))
-            if is_float_regex(record_attributes[-1].strip('"').strip("'"))
-            else 1.0
-        )
+        # Prompt text rows are 5 fields with no weight; keep default 1.0.
+        weight = 1.0
 
         return dict(
             src_id=source,
@@ -1413,7 +1412,6 @@ async def _process_extraction_result(
         chunk_key (str): The chunk key for source tracking
         file_path (str): The file path for citation
         tuple_delimiter (str): Delimiter for tuple fields
-        record_delimiter (str): Delimiter for records
         completion_delimiter (str): Delimiter for completion
     Returns:
         tuple: (nodes_dict, edges_dict) containing the extracted entities and relationships
@@ -3240,6 +3238,7 @@ async def merge_nodes_and_edges(
     current_file_number: int = 0,
     total_files: int = 0,
     file_path: str = "unknown_source",
+    on_anchors_durable: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Merge extracted entities/relations into the KG behind write-ahead anchors.
 
@@ -3269,6 +3268,16 @@ async def merge_nodes_and_edges(
         current_file_number: Current file number for logging
         total_files: Total files for logging
         file_path: File path for logging
+        on_anchors_durable: Optional async hook awaited exactly once, after
+            both Phase 0 anchors are flushed and before the first graph
+            mutation. Lets the caller persist "this document may have touched
+            the graph from here on" (``doc_status.metadata.kg_write_state``)
+            in the one window where that statement flips, so a fail-closed
+            purge can distinguish a document that never reached the graph from
+            one whose anchors were lost. A raise propagates and aborts the
+            merge before any mutation. Not called when the anchor storages or
+            ``doc_id`` are absent (patch-mode merges, which carry their own
+            operation journal as the recovery proof).
     """
 
     # Check for cancellation at the start of merge
@@ -3355,6 +3364,12 @@ async def merge_nodes_and_edges(
                     storage_inst, "namespace", ""
                 )
                 raise IndexFlushError(type(storage_inst).__name__, namespace, e) from e
+
+        # Anchors are durable: this is the last instant at which "no graph
+        # mutation has happened" is still true. A raise here aborts the merge
+        # with the anchors already in place — the safe direction.
+        if on_anchors_durable is not None:
+            await on_anchors_durable()
 
     # Get max async tasks limit from global_config for semaphore control
     graph_max_async = global_config.get("llm_model_max_async", 4) * 2
@@ -3990,21 +4005,42 @@ async def extract_entities(
     # This allows us to cancel remaining tasks if any task fails
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
 
-    # Check if any task raised an exception and ensure all exceptions are retrieved
+    # Check if any task raised an exception and ensure all exceptions are retrieved.
+    #
+    # ORDER: `done` is a SET whose iteration order derives from object identity
+    # (Task inherits object.__hash__, i.e. its memory address), so it is neither
+    # completion order nor creation order, and it is unstable across processes.
+    # Collecting results from it made `chunk_results` a different permutation on
+    # every run of the same document. That permutation reaches persisted state
+    # through merge_nodes_and_edges: `source_id` and `file_path` are built by
+    # order-preserving dedup with no sort to fall back on, and
+    # apply_source_ids_limit then truncates a DIFFERENT subset of chunks. (The
+    # description lists are sorted by (timestamp, -len) downstream, so those are
+    # only exposed on ties -- the persisted id/path fields are the unguarded
+    # ones.) Results are therefore materialised from `tasks`, a list built in
+    # `ordered_chunks` order, so chunk_results[i] always maps to ordered_chunks[i].
+    #
+    # The two passes cannot be folded into one loop over `tasks`: on the
+    # exception path `tasks` still holds pending entries, and calling
+    # .exception() on those raises InvalidStateError, which the `except Exception`
+    # below would latch as `first_exception`, masking the real failure.
     first_exception = None
     chunk_results = []
 
     for task in done:
         try:
             exception = task.exception()
-            if exception is not None:
-                if first_exception is None:
-                    first_exception = exception
-            else:
-                chunk_results.append(task.result())
+            if exception is not None and first_exception is None:
+                first_exception = exception
         except Exception as e:
             if first_exception is None:
                 first_exception = e
+
+    # No exception means FIRST_EXCEPTION behaved as ALL_COMPLETED: `pending` is
+    # empty and every task in `tasks` holds a result. On the exception path we
+    # are about to unwind, so materialising results there would be wasted work.
+    if first_exception is None:
+        chunk_results = [task.result() for task in tasks]
 
     # If any task failed, cancel all pending tasks and raise the first exception
     if first_exception is not None:
@@ -4026,6 +4062,48 @@ async def extract_entities(
     # If all tasks completed successfully, chunk_results already contains the results
     # Return the chunk_results for later processing in merge_nodes_and_edges
     return chunk_results
+
+
+# Policy version of the query-answer cache (cache_type="query"). Bump it when the
+# meaning of an entry changes in a way the other key fields cannot express, so
+# entries written by older versions become unreachable instead of being served
+# under a key whose semantics have moved. v2 retires every entry written before
+# the _answer_cache_kv bypass below: such an entry may hold history-conditioned
+# text filed under a history-blind key, and entries record no history, so a
+# tainted entry cannot be told apart from a clean one. Only the answer cache is
+# versioned; keyword/extract/summary entries never see conversation_history.
+_ANSWER_CACHE_POLICY_VERSION = "query-answer-cache-v2"
+
+
+def _answer_cache_kv(
+    query_param: QueryParam, hashing_kv: BaseKVStorage | None
+) -> BaseKVStorage | None:
+    """Return the storage backing the query-answer cache, or None to bypass it.
+
+    The answer cache key deliberately excludes ``conversation_history``: every
+    turn of a conversation carries a different history, so keying on it would
+    make each entry unique and turn a cache that is meant to be shared across
+    callers into a per-session one. But the history *is* handed to the model as
+    ``history_messages``, so an answer generated under it is not interchangeable
+    with the history-blind key it would be filed under. Requests carrying a
+    history therefore use neither side of the cache:
+
+    - they never write, so caller-supplied history cannot decide the answer that
+      other callers will be served for the same question;
+    - they never read, so a multi-turn caller is not served an answer that was
+      generated while ignoring its history.
+
+    Keyword extraction is unaffected and keeps using ``hashing_kv`` directly: it
+    derives keywords from the query text alone and never receives the history.
+    """
+    if query_param.conversation_history:
+        logger.debug(
+            " == LLM cache == Query answer cache bypassed: conversation_history "
+            f"is set ({len(query_param.conversation_history)} message(s), "
+            f"mode:{query_param.mode})"
+        )
+        return None
+    return hashing_kv
 
 
 async def kg_query(
@@ -4151,13 +4229,22 @@ async def kg_query(
 
     # Call LLM
     tokenizer: Tokenizer = global_config["tokenizer"]
-    len_of_prompts = len(tokenizer.encode(query + sys_prompt))
-    logger.debug(
-        f"[kg_query] Sending to LLM: {len_of_prompts:,} tokens (Query: {len(tokenizer.encode(query))}, System: {len(tokenizer.encode(sys_prompt))})"
-    )
+    # Guarded rather than unconditional: this whole block exists for a debug log,
+    # and an f-string is evaluated eagerly, so the three encodes below used to run
+    # at every log level over the largest string on the query path.
+    if logger.isEnabledFor(logging.DEBUG):
+        query_prompt_tokens = await acount_tokens(tokenizer, query)
+        sys_prompt_tokens = await acount_tokens(tokenizer, sys_prompt)
+        len_of_prompts = await acount_tokens(tokenizer, query + sys_prompt)
+        logger.debug(
+            f"[kg_query] Sending to LLM: {len_of_prompts:,} tokens "
+            f"(Query: {query_prompt_tokens}, System: {sys_prompt_tokens})"
+        )
 
     # Handle cache
+    answer_cache_kv = _answer_cache_kv(query_param, hashing_kv)
     args_hash = compute_args_hash(
+        _ANSWER_CACHE_POLICY_VERSION,
         query_param.mode,
         query,
         query_param.response_type,
@@ -4176,7 +4263,7 @@ async def kg_query(
     )
 
     cached_result = await handle_cache(
-        hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
+        answer_cache_kv, args_hash, user_query, query_param.mode, cache_type="query"
     )
 
     if cached_result is not None:
@@ -4197,11 +4284,12 @@ async def kg_query(
         )
 
         if (
-            hashing_kv
-            and hashing_kv.global_config.get("enable_llm_cache")
+            answer_cache_kv
+            and answer_cache_kv.global_config.get("enable_llm_cache")
             and not is_truncated_response(response)
         ):
             queryparam_dict = {
+                "answer_cache_version": _ANSWER_CACHE_POLICY_VERSION,
                 "mode": query_param.mode,
                 "response_type": query_param.response_type,
                 "top_k": query_param.top_k,
@@ -4218,7 +4306,7 @@ async def kg_query(
                 ),
             }
             await save_to_cache(
-                hashing_kv,
+                answer_cache_kv,
                 CacheData(
                     args_hash=args_hash,
                     content=response,
@@ -4442,10 +4530,13 @@ async def extract_keywords_only(
     )
 
     tokenizer: Tokenizer = global_config["tokenizer"]
-    len_of_prompts = len(tokenizer.encode(kw_prompt))
-    logger.debug(
-        f"[extract_keywords] Sending to LLM: {len_of_prompts:,} tokens (Prompt: {len_of_prompts})"
-    )
+    # Debug-only, so pay for the encode only when it will actually be printed.
+    if logger.isEnabledFor(logging.DEBUG):
+        len_of_prompts = await acount_tokens(tokenizer, kw_prompt)
+        logger.debug(
+            f"[extract_keywords] Sending to LLM: {len_of_prompts:,} tokens "
+            f"(Prompt: {len_of_prompts})"
+        )
 
     # 4. Call the LLM for keyword extraction
     # Apply higher priority (5) to query relation LLM function
@@ -4874,7 +4965,7 @@ async def _apply_token_truncation(
             entity_copy.pop("created_at", None)
             entities_context_for_truncation.append(entity_copy)
 
-        entities_context = truncate_list_by_token_size(
+        entities_context = await atruncate_list_by_token_size(
             entities_context_for_truncation,
             key=lambda x: "\n".join(
                 json.dumps(item, ensure_ascii=False) for item in [x]
@@ -4892,7 +4983,7 @@ async def _apply_token_truncation(
             relation_copy.pop("created_at", None)
             relations_context_for_truncation.append(relation_copy)
 
-        relations_context = truncate_list_by_token_size(
+        relations_context = await atruncate_list_by_token_size(
             relations_context_for_truncation,
             key=lambda x: "\n".join(
                 json.dumps(item, ensure_ascii=False) for item in [x]
@@ -4967,16 +5058,27 @@ async def _attach_content_headings(
     tokenizer = text_chunks_db.global_config.get("tokenizer")
     chunk_ids = [c.get("chunk_id") for c in chunks]
     chunk_data_list = await text_chunks_db.get_by_ids(chunk_ids)
-    for chunk, data in zip(chunks, chunk_data_list):
-        if not isinstance(data, dict):
-            continue
-        headings = _truncate_section_context(
-            format_parent_headings(data),
-            tokenizer,
-            DEFAULT_MAX_SECTION_CONTEXT_TOKENS,
-        )
-        if headings:
-            chunk["content_headings"] = headings
+
+    def _backfill() -> None:
+        for chunk, data in zip(chunks, chunk_data_list):
+            if not isinstance(data, dict):
+                continue
+            headings = _truncate_section_context(
+                format_parent_headings(data),
+                tokenizer,
+                DEFAULT_MAX_SECTION_CONTEXT_TOKENS,
+            )
+            if headings:
+                chunk["content_headings"] = headings
+
+    # The whole loop is one submission, keeping submissions O(1) per request.
+    # It has to leave the event loop at all because this tokenizer is the
+    # long-lived one the storages captured at init, i.e. the SAME object every
+    # concurrent query uses — and two of its other consumers
+    # (_apply_token_truncation, process_chunks_unified) now run in the tokenizer
+    # executor. Left here, two concurrent queries would contend: one holding the
+    # tokenizer in a worker thread while the other waits for it on the loop.
+    await run_in_tokenizer_executor(_backfill)
 
 
 async def _merge_all_chunks(
@@ -5152,7 +5254,7 @@ async def _build_context_str(
         text_chunks_str="",
         reference_list_str="",
     )
-    kg_context_tokens = len(tokenizer.encode(pre_kg_context))
+    kg_context_tokens = await acount_tokens(tokenizer, pre_kg_context)
 
     # Calculate preliminary system prompt tokens
     pre_sys_prompt = sys_prompt_template.format(
@@ -5160,10 +5262,10 @@ async def _build_context_str(
         response_type=response_type,
         user_prompt=user_prompt,
     )
-    sys_prompt_tokens = len(tokenizer.encode(pre_sys_prompt))
+    sys_prompt_tokens = await acount_tokens(tokenizer, pre_sys_prompt)
 
     # Calculate available tokens for text chunks
-    query_tokens = len(tokenizer.encode(query))
+    query_tokens = await acount_tokens(tokenizer, query)
     buffer_tokens = 200  # reserved for reference list and safety buffer
     available_chunk_tokens = max_total_tokens - (
         sys_prompt_tokens + kg_context_tokens + query_tokens + buffer_tokens
@@ -6080,8 +6182,8 @@ async def naive_query(
     )
 
     # Calculate available tokens for chunks
-    sys_prompt_tokens = len(tokenizer.encode(pre_sys_prompt))
-    query_tokens = len(tokenizer.encode(query))
+    sys_prompt_tokens = await acount_tokens(tokenizer, pre_sys_prompt)
+    query_tokens = await acount_tokens(tokenizer, query)
     buffer_tokens = 200  # reserved for reference list and safety buffer
     available_chunk_tokens = max_total_tokens - (
         sys_prompt_tokens + query_tokens + buffer_tokens
@@ -6172,7 +6274,9 @@ async def naive_query(
         return QueryResult(content=prompt_content, raw_data=raw_data)
 
     # Handle cache
+    answer_cache_kv = _answer_cache_kv(query_param, hashing_kv)
     args_hash = compute_args_hash(
+        _ANSWER_CACHE_POLICY_VERSION,
         query_param.mode,
         query,
         query_param.response_type,
@@ -6188,7 +6292,7 @@ async def naive_query(
         serialize_llm_cache_identity(llm_cache_identity),
     )
     cached_result = await handle_cache(
-        hashing_kv, args_hash, user_query, query_param.mode, cache_type="query"
+        answer_cache_kv, args_hash, user_query, query_param.mode, cache_type="query"
     )
     if cached_result is not None:
         cached_response, _ = cached_result  # Extract content, ignore timestamp
@@ -6206,11 +6310,12 @@ async def naive_query(
         )
 
         if (
-            hashing_kv
-            and hashing_kv.global_config.get("enable_llm_cache")
+            answer_cache_kv
+            and answer_cache_kv.global_config.get("enable_llm_cache")
             and not is_truncated_response(response)
         ):
             queryparam_dict = {
+                "answer_cache_version": _ANSWER_CACHE_POLICY_VERSION,
                 "mode": query_param.mode,
                 "response_type": query_param.response_type,
                 "top_k": query_param.top_k,
@@ -6225,7 +6330,7 @@ async def naive_query(
                 ),
             }
             await save_to_cache(
-                hashing_kv,
+                answer_cache_kv,
                 CacheData(
                     args_hash=args_hash,
                     content=response,

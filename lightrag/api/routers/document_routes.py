@@ -5,6 +5,8 @@ This module contains all document-related routes for the LightRAG API.
 import asyncio
 import base64
 import binascii
+import math
+import os
 import re
 import shutil
 import sqlite3
@@ -24,7 +26,17 @@ import aiofiles
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterator, List, NamedTuple, Optional, Any, Literal, Sequence
+from typing import (
+    Annotated,
+    Dict,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Any,
+    Literal,
+    Sequence,
+)
 from fastapi import (
     APIRouter,
     Depends,
@@ -35,7 +47,14 @@ from fastapi import (
     Response,
     UploadFile,
 )
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from lightrag import LightRAG
 from lightrag.api.utils_api import internal_server_error
@@ -61,6 +80,8 @@ from lightrag.constants import (
     DEFAULT_SCAN_ENQUEUE_BATCH_SIZE,
     FILE_EXTRACTION_SUMMARY_PREFIX,
     FULL_DOCS_FORMAT_PENDING_PARSE,
+    MAX_R_SEPARATOR_CHARS,
+    MAX_R_SEPARATORS,
     PARSED_ARTIFACT_DIR_SUFFIXES,
     PARSED_DIR_NAME,
     PROCESS_OPTION_CHUNK_FIXED,
@@ -496,11 +517,27 @@ class FixedTokenChunkParams(_OverlapChunkParams):
 
 
 class RecursiveCharacterChunkParams(_OverlapChunkParams):
-    separators: Optional[list[str]] = None
+    # Caller-supplied separators are safe from ReDoS — ``is_separator_regex`` is
+    # not exposed on this model and defaults to False, so every candidate goes
+    # through ``re.escape`` and matches in linear time. What is NOT bounded by
+    # that is the *size* of the cascade: the splitter walks the list per
+    # recursion level, so cost grows as ``len(separators) x len(text)`` with
+    # both factors supplied by one request.
+    #
+    # This model is only the first of the two places that has to hold. The
+    # cascade also arrives from CHUNK_R_SEPARATORS, from addon_params, from
+    # direct SDK calls, and from per-doc snapshots persisted before this cap
+    # existed — none of which pass through here — so
+    # ``lightrag.chunker.recursive_character.normalize_r_separators`` bounds it
+    # again at the chunker, which is the one point all of them share. The
+    # constants are shared with it so the two can never drift.
+    separators: Optional[
+        list[Annotated[str, StringConstraints(max_length=MAX_R_SEPARATOR_CHARS)]]
+    ] = Field(default=None, max_length=MAX_R_SEPARATORS)
 
 
 class ParagraphSemanticChunkParams(_OverlapChunkParams):
-    # Drop the trailing reference section before chunking. ``None`` means
+    # Drop matching reference blocks before chunking. ``None`` means
     # "not supplied — inherit the addon_params/env default at process time".
     # Detection-tuning knobs (tail window / heading prefixes) are env-only and
     # read live by the chunker, so they are intentionally not exposed here.
@@ -520,22 +557,31 @@ class SemanticVectorChunkParams(_StrictChunkParams):
     # normalizing ints to float). Locked by tests in test_document_routes_chunking.
     breakpoint_threshold_amount: Optional[float] = None
     buffer_size: Optional[int] = Field(default=None, ge=1)
-    sentence_split_regex: Optional[str] = None
+    # ``sentence_split_regex`` is deliberately NOT exposed here. The value
+    # reaches ``re.split`` in lightrag/chunker/semantic_vector.py against text
+    # from the same request, and ``re.compile`` only validates syntax, not
+    # running time: a syntactically valid pattern such as ``(a+)+$`` backtracks
+    # exponentially. CPython's regex engine holds the GIL for the whole match,
+    # so the ``asyncio.to_thread`` hop in the chunker does not keep the event
+    # loop alive either — one request froze the worker process, including
+    # /health, until restart (GHSA-32jh-39m7-8x84, CWE-1333).
+    #
+    # The pattern is operator-tunable via the ``CHUNK_V_SENTENCE_SPLIT_REGEX``
+    # env var (see lightrag/parser/routing.py), which comes from the trusted
+    # deployment rather than from a request body. ``extra="forbid"`` on
+    # ``_StrictChunkParams`` turns any request still carrying the key into a
+    # 422. Do not re-add it: bounding this safely needs process isolation with
+    # a timeout, not a stricter pattern filter.
 
-    @field_validator("sentence_split_regex")
+    @field_validator("breakpoint_threshold_amount", mode="before")
     @classmethod
-    def _valid_sentence_split_regex(cls, v: Optional[str]) -> Optional[str]:
-        # The value is fed to LangChain's SemanticChunker and compiled during
-        # split_text. A malformed pattern (e.g. "(") would only blow up in the
-        # background, so compile it here to reject synchronously (HTTP 422).
-        if v is None:
-            return v
-        try:
-            re.compile(v)
-        except re.error as exc:
-            raise ValueError(
-                f"sentence_split_regex is not a valid regular expression: {exc}"
-            ) from exc
+    def _reject_nonfinite_amount(cls, v: Any) -> Any:
+        # JSON decoders may deliver nan/inf as floats. Raising while leaving
+        # those values in ValidationError.input makes FastAPI's JSONResponse
+        # fail (non-compliant floats) and turn the 422 into a 500. Replace
+        # with a JSON-safe marker so strict float typing rejects cleanly.
+        if isinstance(v, float) and not math.isfinite(v):
+            return "non-finite"
         return v
 
     @model_validator(mode="after")
@@ -543,6 +589,9 @@ class SemanticVectorChunkParams(_StrictChunkParams):
         amt = self.breakpoint_threshold_amount
         if amt is None:
             return self
+        # nan comparisons are always False, so reject non-finite before <= / > checks.
+        if not math.isfinite(amt):
+            raise ValueError("breakpoint_threshold_amount must be a finite number")
         # ``> 0`` is type-independent (every threshold type wants a positive
         # magnitude), so it is safe to enforce at parse time.
         if amt <= 0:
@@ -1358,10 +1407,12 @@ class DocumentManager:
     def iter_new_files(self) -> Iterator[Path]:
         """Yield new, routable input files ONE AT A TIME (LR2 §8.2).
 
-        A single streaming pass: one ``iterdir()`` over the input directory, no
+        A single streaming pass: one ``scandir()`` over the input directory, no
         whole-directory list and no whole-directory sort, so the scan's peak
         memory is set by its enqueue batch (``SCAN_ENQUEUE_BATCH_SIZE``) rather
-        than by how many files the directory holds. An interrupted scan needs no
+        than by how many files the directory holds. ``Path.iterdir()`` is not
+        suitable here because it uses ``os.listdir()`` and materializes every
+        entry name before yielding the first one. An interrupted scan needs no
         in-memory resume state — the next scan re-discovers, and the persistent
         ``doc_status`` rows are the deduplication authority.
 
@@ -1381,22 +1432,24 @@ class DocumentManager:
 
         suffixes = {f".{s}" for s in available_engine_suffixes()}
         logger.debug(f"Streaming scan of {self.input_dir} for {len(suffixes)} suffixes")
-        for file_path in self.input_dir.iterdir():
-            # Suffix comparison is case-sensitive, matching the per-suffix glob
-            # this replaced; ``__parsed__`` and any other directory is skipped.
-            if file_path.suffix not in suffixes or not file_path.is_file():
-                continue
-            if file_path in self.indexed_files:
-                continue
-            try:
-                if not self.is_supported_file(file_path.name):
+        with os.scandir(self.input_dir) as entries:
+            for entry in entries:
+                file_path = Path(entry.path)
+                # Suffix comparison is case-sensitive, matching the per-suffix glob
+                # this replaced; ``__parsed__`` and any other directory is skipped.
+                if file_path.suffix not in suffixes or not file_path.is_file():
                     continue
-            except FilenameParserHintError:
-                # Malformed hint: pass the file through — the enqueue path
-                # reports a detailed error document, instead of the scan
-                # silently ignoring the user's file.
-                pass
-            yield file_path
+                if file_path in self.indexed_files:
+                    continue
+                try:
+                    if not self.is_supported_file(file_path.name):
+                        continue
+                except FilenameParserHintError:
+                    # Malformed hint: pass the file through — the enqueue path
+                    # reports a detailed error document, instead of the scan
+                    # silently ignoring the user's file.
+                    pass
+                yield file_path
 
     def mark_as_indexed(self, file_path: Path):
         self.indexed_files.add(file_path)

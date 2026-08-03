@@ -31,14 +31,19 @@ from lightrag.constants import (
     DUPLICATE_DEMOTION_METADATA_KEYS,
     FILE_EXTRACTION_SUMMARY_PREFIX,
     FULL_DOCS_FORMAT_LIGHTRAG,
+    KG_PURGE_METADATA_KEY,
+    KG_WRITE_STATE_METADATA_KEY,
     LIGHTRAG_DOC_CONTENT_PREFIX,
     PARSED_DIR_NAME,
     PARSER_ENGINE_LEGACY,
     PARSER_ENGINE_NATIVE,
 )
 from lightrag import pipeline_metrics
-from lightrag.exceptions import StorageCapabilityError
-from lightrag.parser.routing import canonicalize_parser_hinted_basename
+from lightrag.exceptions import StorageCapabilityError, StorageRecordNotFoundError
+from lightrag.parser.routing import (
+    canonicalize_parser_hinted_basename,
+    default_chunker_config,
+)
 from lightrag.utils import (
     compute_mdhash_id,
     get_content_summary,
@@ -49,6 +54,80 @@ from lightrag.utils import (
 
 PLACEHOLDER_DOCUMENT_SOURCES = {"", "no-file-path", "unknown_source"}
 SIDECAR_LOCATION_UNKNOWN = "unknown_source"
+
+
+def apply_trusted_sentence_split_regex(
+    v_opts: dict[str, Any],
+    addon_params: Any,
+    *,
+    doc_id: str | None = None,
+) -> dict[str, Any]:
+    """Force ``sentence_split_regex`` to the live, operator-controlled value.
+
+    ``v_opts`` comes from the per-doc ``chunk_options`` snapshot persisted in
+    ``full_docs``. Every other chunker parameter deliberately wins from that
+    snapshot so a document re-processes reproducibly across env changes; this
+    one key is the exception, and is re-read live from
+    ``addon_params['chunker']['semantic_vector']`` (seeded by
+    ``CHUNK_V_SENTENCE_SPLIT_REGEX``) on every run.
+
+    The reason is that the value is splatted into ``re.split`` against the
+    document body. A backtracking pattern such as ``(a+)+$`` runs for
+    exponential time, and CPython's regex engine holds the GIL throughout, so
+    the semantic-vector chunker's ``asyncio.to_thread`` hop does not keep the
+    event loop alive — the worker process stops serving every endpoint until
+    it is restarted (GHSA-32jh-39m7-8x84, CWE-1333).
+
+    ``chunk_options`` is snapshotted at ENQUEUE time, before chunking runs, so
+    a build that still accepted the field on ``/documents/text`` persisted the
+    attacker's pattern to storage *and* left the document in ``PROCESSING``
+    when the worker froze. ``PROCESSING`` is an auto-resume status, so without
+    this scrub an upgraded server would reload the stored pattern and freeze
+    again on every restart — a boot loop that restarting cannot clear.
+    Rejecting the field at the request model only protects new requests; this
+    is what disarms snapshots already on disk.
+
+    The replacement is unconditional, so provenance never has to be
+    reconstructed — which also means a *legitimate* per-document pattern
+    handed to ``apipeline_enqueue_documents(chunk_options=…)`` by an SDK caller
+    is discarded the same way. That is intended: the only supported way to
+    change the splitter is ``addon_params['chunker']['semantic_vector']`` /
+    ``CHUNK_V_SENTENCE_SPLIT_REGEX``. Because the loss is silent from the
+    caller's side, every discard of a *differing* snapshot value is logged at
+    WARNING with the doc id.
+
+    This is the single point where the guarantee is enforced: the ``"V"``
+    dispatch in :meth:`_PipelineMixin.process_single_document` is currently the
+    only consumer of ``chunk_options['semantic_vector']``. Any new consumer
+    MUST route through this helper — the poisoned value is left in place in
+    ``full_docs`` (inert, not rewritten), so an unscrubbed read would revive it.
+
+    Returns a new dict; ``v_opts`` is not mutated.
+    """
+    sanitized = {k: v for k, v in v_opts.items() if k != "sentence_split_regex"}
+    chunker_cfg = (addon_params or {}).get("chunker") or default_chunker_config()
+    live_regex = (chunker_cfg.get("semantic_vector") or {}).get("sentence_split_regex")
+    if live_regex:
+        sanitized["sentence_split_regex"] = live_regex
+
+    snapshot_regex = v_opts.get("sentence_split_regex")
+    if snapshot_regex is not None and snapshot_regex != live_regex:
+        # Audit line for a decision with consequences: either a pre-fix build
+        # persisted an attacker pattern (the case this helper exists for), or
+        # an SDK caller's per-doc value is being dropped. The pattern is
+        # untrusted text, so log a bounded repr rather than the raw string.
+        shown = repr(snapshot_regex)
+        if len(shown) > 120:
+            shown = shown[:117] + "..."
+        logger.warning(
+            "Discarded persisted sentence_split_regex %s for doc %s; using the "
+            "operator-configured pattern instead (GHSA-32jh-39m7-8x84). Set "
+            "CHUNK_V_SENTENCE_SPLIT_REGEX or addon_params['chunker']"
+            "['semantic_vector'] to change the V sentence splitter.",
+            shown,
+            doc_id or "<unknown>",
+        )
+    return sanitized
 
 
 def build_chunks_dict_from_chunking_result(
@@ -302,6 +381,15 @@ _DOC_STATUS_METADATA_CARRY_OVER_KEYS: tuple[str, ...] = (
     # in-flight/failed ainsert_custom_chunks operation. Must survive every
     # status transition until the operation commits or is rolled back.
     CUSTOM_CHUNK_PATCH_METADATA_KEY,
+    # KG write-progress marker and whole-document purge journal (issue #3400
+    # fail-closed purge). Both are load-bearing recovery state, not display
+    # fields: ``kg_write_state`` is the proof that lets a purge clean up an
+    # anchor-less document that never reached the graph, and ``kg_purge`` is
+    # what distinguishes "anchors already deleted by a purge that got that far"
+    # from "anchors were never there". Dropping either on a transition turns a
+    # resumable purge into a permanent fail-closed refusal.
+    KG_WRITE_STATE_METADATA_KEY,
+    KG_PURGE_METADATA_KEY,
     # Duplicate demotion. ``metadata.is_duplicate`` is not a display field: it is
     # the ONLY thing that makes a row ineligible as a primary candidate for its
     # canonical source (``_basename_of`` returns None for it), so an operator's
@@ -354,6 +442,90 @@ def doc_status_custom_chunk_patch(status_doc: Any) -> dict[str, Any] | None:
     return journal if isinstance(journal, dict) else None
 
 
+def make_kg_purge_operation_id(doc_key: str, chunk_ids: list[str]) -> str:
+    """Deterministic operation id for one whole-document purge (issue #3400).
+
+    Identifies "the same logical purge" across retries so a resumed run can
+    trust the journaled phase. Derived from the document key plus its chunk-id
+    SET (sorted and de-duplicated, unlike
+    :func:`make_custom_chunk_operation_id` which pins an ordered list): a purge
+    assembles ``chunk_ids`` from ``chunks_list`` unioned with a custom-chunk
+    journal, so the order is an assembly artifact while the set is the thing
+    that determines what gets deleted. Length-prefixed like
+    :func:`make_custom_chunk_id` so a caller-supplied ``doc_id`` cannot collide
+    with another document's chunk-id list.
+    """
+    joined = "|".join(sorted(set(chunk_ids)))
+    return compute_mdhash_id(f"{len(doc_key)}:{doc_key}:{joined}", prefix="purge-")
+
+
+def doc_status_kg_write_state(status_doc: Any) -> str | None:
+    """Return how far this document's KG write progressed, if recorded.
+
+    ``None`` means UNKNOWN — a pre-#3416 document. The marker is monotonic
+    and never cleared: a PROCESSED document keeps ``graph_mutation_started``
+    (its anchors serve as the proof from then on). A fail-closed purge
+    treats UNKNOWN as "may have touched the graph".
+    """
+    if status_doc is None:
+        return None
+    raw_metadata = doc_status_field(status_doc, "metadata", {})
+    if not isinstance(raw_metadata, dict):
+        return None
+    state = raw_metadata.get(KG_WRITE_STATE_METADATA_KEY)
+    return state if isinstance(state, str) and state else None
+
+
+def doc_status_kg_purge_journal(status_doc: Any) -> dict[str, Any] | None:
+    """Return the whole-document purge journal from a doc-status record, if any.
+
+    Accepts either a ``DocProcessingStatus`` object or a raw storage dict.
+    Returns ``None`` when no purge is in flight (the normal case).
+    """
+    if status_doc is None:
+        return None
+    raw_metadata = doc_status_field(status_doc, "metadata", {})
+    if not isinstance(raw_metadata, dict):
+        return None
+    journal = raw_metadata.get(KG_PURGE_METADATA_KEY)
+    return journal if isinstance(journal, dict) else None
+
+
+async def require_doc_status_record(
+    doc_status: Any, doc_id: str, *, purpose: str
+) -> dict[str, Any]:
+    """Point-read a doc_status row that a load-bearing metadata write needs.
+
+    For writers of KG recovery state (``kg_write_state``, ``kg_purge``): they
+    read the row only to rebuild the opaque ``metadata`` blob around the key
+    they change, and every one of them runs while the row is guaranteed to
+    exist (mid-merge under the pipeline reservation, mid-purge before the
+    caller's finalization). ``None`` is therefore never a state to proceed
+    past — it is the read failing to prove the state the write depends on.
+
+    Strict where the backend supports it, so a transport/index failure raises
+    with its real cause instead of masquerading as an absent row (a plain
+    ``get_by_id`` may treat backend trouble as a best-effort miss). Whatever
+    the read path, ``None`` raises ``StorageRecordNotFoundError``: proceeding
+    silently is how the marker stays ``pre_graph`` while the graph is written,
+    or how a destructive purge runs unjournaled — both of which manufacture
+    exactly the unprovable states issue #3400's fail-closed contract exists to
+    prevent. Callers abort instead: an aborted merge (anchors already durable)
+    or an aborted purge (nothing deleted yet) is always the safe direction.
+    """
+    strict = getattr(doc_status, "supports_strict_point_reads", False)
+    record = await (
+        doc_status.get_by_id_strict(doc_id) if strict else doc_status.get_by_id(doc_id)
+    )
+    if record is None:
+        raise StorageRecordNotFoundError(
+            f"doc_status record for {doc_id} is "
+            f"{'confirmed absent' if strict else 'absent or unreadable'} "
+            f"while trying to {purpose}; refusing to proceed without it"
+        )
+    return record
+
+
 def doc_status_metadata_carry_over(status_doc: Any) -> dict[str, Any]:
     """Return the subset of ``status_doc.metadata`` to preserve across upserts.
 
@@ -380,16 +552,26 @@ def doc_status_transition_metadata(
     status_doc: Any,
     *,
     extra: dict[str, Any] | None = None,
+    drop: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Build a doc_status ``metadata`` payload that preserves carry-over fields.
 
     Use at every state-transition upsert site so the user's
     ``process_options`` (and any future long-lived metadata fields) survive
     PENDING → PARSING → ANALYZING → PROCESSING → PROCESSED / FAILED.
+
+    ``drop`` removes keys AFTER carry-over and ``extra`` are applied, which is
+    the only way to retire a carried-over key: passing it in ``extra`` with a
+    ``None``/empty value would persist that value rather than remove the key,
+    and omitting it just lets carry-over put it back. Used to clear the
+    ``kg_write_state`` / ``kg_purge`` recovery markers at PROCESSED, where the
+    document's recovery anchors take over as the proof.
     """
     payload = doc_status_metadata_carry_over(status_doc)
     if extra:
         payload.update(extra)
+    for key in drop:
+        payload.pop(key, None)
     return payload
 
 
@@ -408,6 +590,14 @@ _DOC_STATUS_METADATA_DIRECTIVE_KEYS: tuple[str, ...] = (
     # journal must survive — stripping it would orphan the operation's staged
     # data with no recovery anchor (issue #3400).
     CUSTOM_CHUNK_PATCH_METADATA_KEY,
+    # A FAILED→PENDING reset is exactly the case that must not strip these: the
+    # retry re-runs extraction, and if a previous attempt's purge is half-done
+    # (anchors deleted, journal at ``anchors_pending``) the journal is the only
+    # thing keeping that purge resumable rather than permanently refused. The
+    # write-state marker rides along for the same reason — the reset leaves the
+    # document PENDING, i.e. still pre-graph.
+    KG_WRITE_STATE_METADATA_KEY,
+    KG_PURGE_METADATA_KEY,
     # A demotion is an operator decision, not a per-attempt result: the manual
     # FAILED→PENDING retry must not undo it. A demoted row keeps its content and
     # its FAILED status, so it is reset like any other failed document — and

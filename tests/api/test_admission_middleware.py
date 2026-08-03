@@ -329,6 +329,41 @@ async def test_api_prefix_is_stripped_before_matching():
     assert downstream.calls == 0
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/documents/upload",  # verbatim forwarding
+        "/documents/upload",  # nginx stripped the prefix
+    ],
+)
+async def test_mount_prefix_never_collapses_the_pre_auth_check(monkeypatch, path):
+    """The pre-auth check uses the same matcher as the route, so it inherited the
+    same defect: with the shipped default whitelist and a mount prefix starting
+    with ``/api``, every path matched the bare ``/api`` prefix entry and the
+    unauthenticated request was waved straight through to the body.
+
+    Both forwarding forms are covered because this middleware sits outside
+    ``_RootPathNormalizationMiddleware``: with a proxy that strips the prefix it
+    sees a bare path while ``root_path`` is already set.
+    """
+    monkeypatch.setattr(_utils_api, "auth_configured", True)
+    monkeypatch.setattr(
+        _utils_api, "whitelist_patterns", [("/health", False), ("/api", True)]
+    )
+    rag = await _rag(capacity=10)
+    downstream = _Downstream()
+    recorder = _Recorder()
+
+    scope = _scope(path=path)
+    scope["root_path"] = "/api/v1"
+    await _mw(rag, downstream, api_key="secret")(scope, recorder.receive, recorder.send)
+
+    assert recorder.status == 401
+    assert downstream.calls == 0
+    assert recorder.receives == 0  # refused before the body, as always
+    assert await _tokens(rag) == {}
+
+
 async def test_disabled_capacity_is_a_pure_passthrough():
     rag = await _rag(capacity=0, active=10_000)
     downstream = _Downstream()
@@ -435,148 +470,3 @@ async def test_route_adopts_the_middleware_reservation_instead_of_taking_a_secon
 
 async def _no_existing_doc(*args, **kwargs):
     return None
-
-
-# --------------------------------------------------------------------------- #
-# request body ceiling (LR2 §9.4)
-# --------------------------------------------------------------------------- #
-
-
-class _StreamingRecorder(_Recorder):
-    """Feeds the body in chunks so the counting wrapper is exercised, and reports
-    how many chunks the app actually got."""
-
-    def __init__(self, chunks: list[bytes], declared_length: bytes | None = None):
-        super().__init__()
-        self._chunks = list(chunks)
-        self.declared_length = declared_length
-        self.delivered = 0
-
-    async def receive(self):
-        self.receives += 1
-        if not self._chunks:
-            return {"type": "http.disconnect"}
-        chunk = self._chunks.pop(0)
-        self.delivered += 1
-        return {
-            "type": "http.request",
-            "body": chunk,
-            "more_body": bool(self._chunks),
-        }
-
-
-class _BodyReader:
-    """Downstream app that drains the whole body, like multipart parsing does."""
-
-    def __init__(self):
-        self.received = b""
-        self.completed = False
-
-    async def __call__(self, scope, receive, send):
-        while True:
-            message = await receive()
-            if message["type"] != "http.request":
-                break
-            self.received += message.get("body", b"")
-            if not message.get("more_body"):
-                break
-        self.completed = True
-        await send(
-            {"type": "http.response.start", "status": 200, "headers": []},
-        )
-        await send({"type": "http.response.body", "body": b"{}"})
-
-
-async def test_oversized_declared_length_is_refused_before_the_body():
-    """The honest-client shortcut: Content-Length alone is enough to say no, and
-    no capacity slot is spent on the way."""
-    rag = await _rag(capacity=10)
-    app = _BodyReader()
-    recorder = _StreamingRecorder([b"x" * 100])
-
-    middleware = _mw(rag, app, max_body_bytes=50)
-    await middleware(
-        _scope(headers=[(b"content-length", b"100")]),
-        recorder.receive,
-        recorder.send,
-    )
-
-    assert recorder.status == 413
-    assert recorder.receives == 0
-    assert app.completed is False
-    assert await _tokens(rag) == {}
-
-
-async def test_understated_length_is_still_cut_off_mid_stream():
-    """Content-Length is a hint, not the protection: a body that keeps coming is
-    stopped by the counting wrapper, and nothing was buffered to find out."""
-    rag = await _rag(capacity=10)
-    app = _BodyReader()
-    # Declares 10 bytes, sends 300 in three chunks.
-    recorder = _StreamingRecorder(
-        [b"x" * 100, b"y" * 100, b"z" * 100], declared_length=b"10"
-    )
-
-    middleware = _mw(rag, app, max_body_bytes=150)
-    await middleware(
-        _scope(headers=[(b"content-length", b"10")]),
-        recorder.receive,
-        recorder.send,
-    )
-
-    assert recorder.status == 413
-    # The first chunk passed through, the second tripped the limit: the app never
-    # saw a complete body, and the stream was not drained past the ceiling.
-    assert app.completed is False
-    assert recorder.delivered == 2
-
-
-async def test_body_within_the_limit_streams_through_untouched():
-    rag = await _rag(capacity=10)
-    app = _BodyReader()
-    recorder = _StreamingRecorder([b"a" * 40, b"b" * 40])
-
-    middleware = _mw(rag, app, max_body_bytes=100)
-    await middleware(_scope(), recorder.receive, recorder.send)
-
-    assert recorder.status == 200
-    assert app.completed is True
-    assert app.received == b"a" * 40 + b"b" * 40
-
-
-async def test_body_limit_works_with_admission_disabled():
-    """§9.4: each branch honours its own switch, so a deployment may enable the
-    byte ceiling without any capacity limit."""
-    rag = await _rag(capacity=0)
-    app = _BodyReader()
-    recorder = _StreamingRecorder([b"x" * 200])
-
-    middleware = _mw(rag, app, max_body_bytes=50)
-    await middleware(_scope(), recorder.receive, recorder.send)
-
-    assert recorder.status == 413
-    assert await _tokens(rag) == {}
-
-
-async def test_body_limit_releases_an_unadopted_reservation():
-    """A request killed by the ceiling must not leave capacity charged."""
-    rag = await _rag(capacity=10)
-    app = _BodyReader()
-    recorder = _StreamingRecorder([b"x" * 200])
-
-    middleware = _mw(rag, app, max_body_bytes=50)
-    await middleware(_scope(), recorder.receive, recorder.send)
-
-    assert recorder.status == 413
-    assert await _tokens(rag) == {}
-
-
-async def test_no_limit_configured_leaves_receive_unwrapped():
-    rag = await _rag(capacity=10)
-    app = _BodyReader()
-    recorder = _StreamingRecorder([b"x" * 10_000])
-
-    await _mw(rag, app)(_scope(), recorder.receive, recorder.send)
-
-    assert recorder.status == 200
-    assert len(app.received) == 10_000
