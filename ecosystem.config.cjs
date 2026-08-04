@@ -8,6 +8,15 @@ module.exports = {
       env: {
         PYTHONUNBUFFERED: '1'
       }
+    },
+    {
+      name: 'lightrag-9621',
+      cwd: '/data/workspace/lightrag_all/LightRAG',
+      script: './start-9621.sh',
+      interpreter: 'bash',
+      env: {
+        PYTHONUNBUFFERED: '1'
+      }
     }
   ]
 }
